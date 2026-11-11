@@ -1,0 +1,58 @@
+---
+import { getCollection } from 'astro:content';
+import PageIntro from '../../../components/PageIntro.astro';
+import SiteLayout from '../../../layouts/SiteLayout.astro';
+import { articleUrl, formatArticleDate, sortArticles } from '../../../lib/articles';
+
+const articles = sortArticles(await getCollection('articles'));
+const initialQuery = Astro.url.searchParams.get('q') ?? '';
+---
+
+<SiteLayout
+  title="Search writing | Qian Kevin"
+  description="Search articles and notes across the writing archive."
+>
+  <div class="site-page">
+    <div class="site-page-inner">
+      <PageIntro
+        eyebrow="Knowledge hub"
+        title="Search writing"
+        description="Search article titles, summaries, and content. Search runs locally in your browser."
+      />
+      <form class="search-form" action="/writing/search/" method="get" data-writing-search>
+        <label for="writing-query">Search articles</label>
+        <div>
+          <input
+            id="writing-query"
+            name="q"
+            type="search"
+            value={initialQuery}
+            data-search-input
+          />
+          <button type="submit" class="button-primary">Search</button>
+        </div>
+      </form>
+      <p class="search-status" data-search-status role="status" aria-live="polite">
+        Showing all {articles.length} {articles.length === 1 ? 'article' : 'articles'}.
+      </p>
+      <ol class="search-results" data-search-results>
+        {articles.map((article) => (
+          <li
+            data-search-entry
+            data-search-text={`${article.data.title} ${article.data.description} ${article.body ?? ''}`}
+          >
+            <time datetime={article.data.publishedAt.toISOString().slice(0, 10)}>
+              {formatArticleDate(article.data.publishedAt)}
+            </time>
+            <h2><a href={articleUrl(article)}>{article.data.title}</a></h2>
+            <p>{article.data.description}</p>
+          </li>
+        ))}
+      </ol>
+      <noscript>
+        <p>Search filtering requires JavaScript. All articles are listed above.</p>
+      </noscript>
+    </div>
+  </div>
+  <script is:inline src="/js/writing-search.js" defer></script>
+</SiteLayout>

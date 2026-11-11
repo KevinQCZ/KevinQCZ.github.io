@@ -1,0 +1,25 @@
+---
+interface Props {
+  pageNumber: number;
+  totalPages: number;
+}
+
+const { pageNumber, totalPages } = Astro.props;
+const pageUrl = (page: number) => page === 1 ? '/writing/' : `/writing/page/${page}/`;
+---
+
+{totalPages > 1 && (
+  <nav class="article-pagination-controls" aria-label="Writing pages">
+    {pageNumber > 1 ? (
+      <a href={pageUrl(pageNumber - 1)} rel="prev">Previous</a>
+    ) : (
+      <span aria-disabled="true">Previous</span>
+    )}
+    <span aria-current="page">Page {pageNumber} of {totalPages}</span>
+    {pageNumber < totalPages ? (
+      <a href={pageUrl(pageNumber + 1)} rel="next">Next</a>
+    ) : (
+      <span aria-disabled="true">Next</span>
+    )}
+  </nav>
+)}

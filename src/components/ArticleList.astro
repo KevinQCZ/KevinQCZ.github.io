@@ -1,0 +1,43 @@
+---
+import {
+  articleUrl,
+  formatArticleDate,
+  taxonomyUrl,
+  type Article
+} from '../lib/articles';
+
+interface Props {
+  articles: Article[];
+  emptyMessage?: string;
+}
+
+const { articles, emptyMessage = 'No articles are available here yet.' } = Astro.props;
+---
+
+{articles.length ? (
+  <div class="article-list">
+    {articles.map((article) => (
+      <article class="article-list-item">
+        <time datetime={article.data.publishedAt.toISOString().slice(0, 10)}>
+          {formatArticleDate(article.data.publishedAt)}
+        </time>
+        <div>
+          <h2><a href={articleUrl(article)}>{article.data.title}</a></h2>
+          <p>{article.data.description}</p>
+          {(article.data.categories.length > 0 || article.data.tags.length > 0) && (
+            <ul class="article-taxonomies" aria-label="Topics">
+              {article.data.categories.map((category) => (
+                <li><a href={taxonomyUrl('categories', category)}>{category}</a></li>
+              ))}
+              {article.data.tags.map((tag) => (
+                <li><a href={taxonomyUrl('tags', tag)}>#{tag}</a></li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </article>
+    ))}
+  </div>
+) : (
+  <p class="empty-state">{emptyMessage}</p>
+)}

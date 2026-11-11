@@ -1,0 +1,63 @@
+---
+import SiteLayout from '../layouts/SiteLayout.astro';
+import ArticleList from '../components/ArticleList.astro';
+import { getCollection } from 'astro:content';
+import { sortArticles } from '../lib/articles';
+
+const focusAreas = [
+  {
+    title: 'Software engineering',
+    description: 'Systems, tools, and practical software design.'
+  },
+  {
+    title: 'Supply chain',
+    description: 'Operational problems, data, and decision-making.'
+  },
+  {
+    title: 'Applied AI',
+    description: 'Useful applications, trade-offs, and experiments.'
+  }
+];
+
+const latestWriting = sortArticles(await getCollection('articles')).slice(0, 3);
+---
+
+<SiteLayout
+  title="Qian Kevin | Technology, supply chain, and AI"
+  description="Practical ideas and work across software engineering, supply chain, and applied AI."
+>
+  <section class="home-intro" aria-labelledby="home-title">
+    <p class="eyebrow">Knowledge hub · technical portfolio</p>
+    <h1 id="home-title">Technology, supply chain, and AI - connected through practical engineering.</h1>
+    <p>
+      I use this space to share ideas and work across software engineering, supply chain, and applied AI.
+    </p>
+    <div class="home-actions">
+      <a class="button-primary" href="/projects/">Explore projects</a>
+      <a class="button-secondary" href="/writing/">Read writing</a>
+    </div>
+  </section>
+
+  <section class="home-sections" aria-labelledby="focus-title">
+    <div class="section-heading">
+      <h2 id="focus-title">Areas of focus</h2>
+      <a href="/about/">About this site</a>
+    </div>
+    <div class="focus-grid">
+      {focusAreas.map((area) => (
+        <article class="content-card">
+          <h3>{area.title}</h3>
+          <p>{area.description}</p>
+        </article>
+      ))}
+    </div>
+  </section>
+
+  <section class="home-sections" aria-labelledby="latest-writing-title">
+    <div class="section-heading">
+      <h2 id="latest-writing-title">Latest writing</h2>
+      <a href="/writing/">Browse all writing</a>
+    </div>
+    <ArticleList articles={latestWriting} />
+  </section>
+</SiteLayout>

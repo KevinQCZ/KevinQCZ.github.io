@@ -1,0 +1,54 @@
+---
+import { getCollection } from 'astro:content';
+import PageIntro from '../../components/PageIntro.astro';
+import SiteLayout from '../../layouts/SiteLayout.astro';
+import { sortArticles } from '../../lib/articles';
+
+const articles = sortArticles(await getCollection('articles'));
+const years = [...new Set(articles.map((article) => article.data.publishedAt.getUTCFullYear()))]
+  .sort((a, b) => b - a);
+---
+
+<SiteLayout
+  title="Archives | Qian Kevin"
+  description="Browse the writing archive by year and month."
+>
+  <div class="site-page">
+    <div class="site-page-inner">
+      <PageIntro eyebrow="Writing" title="Archive" description="Browse articles by publication date." />
+      {years.length ? (
+        <div class="archive-years">
+          {years.map((year) => {
+            const yearArticles = articles.filter(
+              (article) => article.data.publishedAt.getUTCFullYear() === year
+            );
+            const months = [...new Set(
+              yearArticles.map((article) => article.data.publishedAt.getUTCMonth() + 1)
+            )].sort((a, b) => b - a);
+            return (
+              <section class="archive-year" aria-labelledby={`year-${year}`}>
+                <h2 id={`year-${year}`}><a href={`/archives/${year}/`}>{year}</a></h2>
+                <ul class="topic-links">
+                  {months.map((month) => (
+                    <li>
+                      <a href={`/archives/${year}/${String(month).padStart(2, '0')}/`}>
+                        {new Intl.DateTimeFormat('en', { month: 'long', timeZone: 'UTC' }).format(
+                          new Date(Date.UTC(year, month - 1, 1))
+                        )}
+                        <span> ({yearArticles.filter(
+                          (article) => article.data.publishedAt.getUTCMonth() + 1 === month
+                        ).length})</span>
+                      </a>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            );
+          })}
+        </div>
+      ) : (
+        <p class="empty-state">No archived articles are available yet.</p>
+      )}
+    </div>
+  </div>
+</SiteLayout>

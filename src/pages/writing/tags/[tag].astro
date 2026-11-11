@@ -1,0 +1,37 @@
+---
+import { getCollection } from 'astro:content';
+import ArticleList from '../../../components/ArticleList.astro';
+import PageIntro from '../../../components/PageIntro.astro';
+import SiteLayout from '../../../layouts/SiteLayout.astro';
+import {
+  sortArticles,
+  taxonomySlug,
+  uniqueTaxonomies
+} from '../../../lib/articles';
+
+export async function getStaticPaths() {
+  const articles = sortArticles(await getCollection('articles'));
+  const tags = uniqueTaxonomies(articles, 'tags');
+  return tags.map((tag) => ({
+    params: { tag: taxonomySlug(tag) },
+    props: {
+      tag,
+      articles: articles.filter((article) => article.data.tags.includes(tag))
+    }
+  }));
+}
+
+const { tag, articles: tagArticles } = Astro.props;
+---
+
+<SiteLayout
+  title={`#${tag} | Writing | Qian Kevin`}
+  description={`Articles tagged ${tag}.`}
+>
+  <div class="site-page">
+    <div class="site-page-inner">
+      <PageIntro eyebrow="Writing tag" title={`#${tag}`} />
+      <ArticleList articles={tagArticles} />
+    </div>
+  </div>
+</SiteLayout>

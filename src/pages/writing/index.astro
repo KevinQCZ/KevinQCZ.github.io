@@ -1,0 +1,68 @@
+---
+import { getCollection } from 'astro:content';
+import ArticleList from '../../components/ArticleList.astro';
+import ArticlePagination from '../../components/ArticlePagination.astro';
+import PageIntro from '../../components/PageIntro.astro';
+import SiteLayout from '../../layouts/SiteLayout.astro';
+import {
+  sortArticles,
+  taxonomyUrl,
+  uniqueTaxonomies
+} from '../../lib/articles';
+import { ARTICLES_PER_PAGE, paginateItems } from '../../lib/pagination';
+
+const articles = sortArticles(await getCollection('articles'));
+const categories = uniqueTaxonomies(articles, 'categories');
+const tags = uniqueTaxonomies(articles, 'tags');
+const page = paginateItems(articles, 1, ARTICLES_PER_PAGE);
+---
+
+<SiteLayout
+  title="Writing | Qian Kevin"
+  description="Articles and notes on software engineering, supply chain, and applied AI."
+>
+  <div class="site-page">
+    <div class="site-page-inner">
+      <PageIntro
+        eyebrow="Knowledge hub"
+        title="Writing"
+        description="Notes and articles on software engineering, supply chain, and applied AI."
+      />
+      {(categories.length > 0 || tags.length > 0) && (
+        <nav class="topic-index" aria-label="Writing topics">
+          {categories.length > 0 && (
+            <div>
+              <h2>Categories</h2>
+              <ul class="topic-links">
+                {categories.map((category) => (
+                  <li><a href={taxonomyUrl('categories', category)}>{category}</a></li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {tags.length > 0 && (
+            <div>
+              <h2>Tags</h2>
+              <ul class="topic-links">
+                {tags.map((tag) => (
+                  <li><a href={taxonomyUrl('tags', tag)}>#{tag}</a></li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </nav>
+      )}
+      <section class="site-section" aria-labelledby="articles-title">
+        <div class="section-heading">
+          <h2 id="articles-title">Articles</h2>
+          <div class="section-links">
+            <a href="/writing/search/">Search writing</a>
+            <a href="/archives/">Browse the full archive</a>
+          </div>
+        </div>
+        <ArticleList articles={page.items} />
+        <ArticlePagination pageNumber={page.pageNumber} totalPages={page.totalPages} />
+      </section>
+    </div>
+  </div>
+</SiteLayout>

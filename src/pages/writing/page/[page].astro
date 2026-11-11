@@ -1,0 +1,43 @@
+---
+import { getCollection } from 'astro:content';
+import ArticleList from '../../../components/ArticleList.astro';
+import ArticlePagination from '../../../components/ArticlePagination.astro';
+import PageIntro from '../../../components/PageIntro.astro';
+import SiteLayout from '../../../layouts/SiteLayout.astro';
+import { sortArticles } from '../../../lib/articles';
+import { ARTICLES_PER_PAGE, paginateItems } from '../../../lib/pagination';
+
+interface Props {
+  pageNumber: number;
+  totalPages: number;
+}
+
+export async function getStaticPaths() {
+  const articles = sortArticles(await getCollection('articles'));
+  const totalPages = paginateItems(articles, 1, ARTICLES_PER_PAGE).totalPages;
+  return Array.from({ length: totalPages - 1 }, (_, index) => {
+    const pageNumber = index + 2;
+    return {
+      params: { page: String(pageNumber) },
+      props: { pageNumber, totalPages }
+    };
+  });
+}
+
+const { pageNumber, totalPages } = Astro.props as Props;
+const articles = sortArticles(await getCollection('articles'));
+const page = paginateItems(articles, pageNumber, ARTICLES_PER_PAGE);
+---
+
+<SiteLayout
+  title={`Writing | Page ${pageNumber} | Qian Kevin`}
+  description={`Articles on page ${pageNumber} of the writing archive.`}
+>
+  <div class="site-page">
+    <div class="site-page-inner">
+      <PageIntro eyebrow="Knowledge hub" title={`Writing · Page ${pageNumber}`} />
+      <ArticleList articles={page.items} />
+      <ArticlePagination pageNumber={page.pageNumber} totalPages={totalPages} />
+    </div>
+  </div>
+</SiteLayout>

@@ -1,0 +1,85 @@
+---
+interface Props {
+  lang?: 'en' | 'zh-Hans';
+}
+
+const { lang = 'en' } = Astro.props;
+const currentPath = Astro.url.pathname;
+const isChinese = lang === 'zh-Hans';
+const links = isChinese
+  ? [
+      { href: '/', label: '首页' },
+      { href: '/writing/', label: '文章' },
+      { href: '/projects/', label: '项目' },
+      { href: '/about/', label: '关于' }
+    ]
+  : [
+      { href: '/', label: 'Home' },
+      { href: '/writing/', label: 'Writing' },
+      { href: '/projects/', label: 'Projects' },
+      { href: '/about/', label: 'About' }
+    ];
+---
+
+<header class="header site-header">
+  <div class="header-inner">
+    <div class="site-brand-wrapper">
+      <a
+        class="brand"
+        href={isChinese ? '/zh/' : '/'}
+        aria-label={isChinese ? 'Qian Kevin，技术、供应链与人工智能' : 'Qian Kevin - Technology, supply chain, and AI'}
+      >
+        <span class="site-title">Qian Kevin</span>
+        <span class="site-subtitle">
+          {isChinese ? '技术、供应链与人工智能' : 'Technology, supply chain, and AI'}
+        </span>
+      </a>
+      <div class="site-nav-toggle">
+        <button
+          type="button"
+          data-menu-toggle
+          data-label-open={isChinese ? '打开导航' : 'Open navigation'}
+          data-label-close={isChinese ? '关闭导航' : 'Close navigation'}
+          aria-label={isChinese ? '打开导航' : 'Open navigation'}
+          aria-controls="primary-navigation"
+          aria-expanded="false"
+        >
+          <span class="btn-bar"></span>
+          <span class="btn-bar"></span>
+          <span class="btn-bar"></span>
+        </button>
+      </div>
+    </div>
+
+    <nav
+      id="primary-navigation"
+      class="site-nav"
+      aria-label={isChinese ? '主导航' : 'Primary navigation'}
+    >
+      <ul class="menu">
+        {links.map((link) => (
+          <li class="menu-item">
+            <a href={link.href} aria-current={currentPath === link.href ? 'page' : undefined}>
+              {link.label}
+            </a>
+          </li>
+        ))}
+        <li class="menu-item">
+          <a href={isChinese ? '/' : '/zh/'} lang={isChinese ? 'en' : 'zh-Hans'}>
+            {isChinese ? 'English' : '中文'}
+          </a>
+        </li>
+        <li class="menu-item">
+          <button
+            type="button"
+            data-theme-toggle
+            aria-label={isChinese ? '切换主题' : 'Switch theme'}
+            aria-pressed="false"
+          >
+            {isChinese ? '主题' : 'Theme'}
+          </button>
+        </li>
+      </ul>
+    </nav>
+  </div>
+</header>
