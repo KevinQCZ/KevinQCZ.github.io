@@ -1,0 +1,21 @@
+---
+interface Props {
+  lang?: 'en' | 'zh-Hans';
+}
+
+const { lang = 'en' } = Astro.props;
+const isChinese = lang === 'zh-Hans';
+---
+
+<footer class="footer">
+  <div class="footer-inner">
+    <span>© {new Date().getFullYear()} Qian Kevin</span>
+    <nav class="footer-nav" aria-label={isChinese ? '页脚导航' : 'Footer navigation'}>
+      <a href={isChinese ? '/zh/' : '/'}>{isChinese ? '首页' : 'Home'}</a>
+      <a href="/writing/">{isChinese ? '文章' : 'Writing'}</a>
+      <a href="/projects/">{isChinese ? '项目' : 'Projects'}</a>
+      <a href="/about/">{isChinese ? '关于' : 'About'}</a>
+      <a href="/rss.xml">RSS</a>
+    </nav>
+  </div>
+</footer>

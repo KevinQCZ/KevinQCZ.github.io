@@ -1,0 +1,73 @@
+---
+import { getCollection, render } from 'astro:content';
+import PageIntro from '../../components/PageIntro.astro';
+import SiteLayout from '../../layouts/SiteLayout.astro';
+import { projectUrl, sortProjects, type Project } from '../../lib/projects';
+
+interface Props {
+  project: Project;
+  previousProject?: Project;
+  nextProject?: Project;
+}
+
+export async function getStaticPaths() {
+  const projects = sortProjects(await getCollection('projects', ({ data }) => !data.draft));
+  return projects.map((project, index) => ({
+    params: { slug: project.data.slug },
+    props: {
+      project,
+      previousProject: projects[index - 1],
+      nextProject: projects[index + 1]
+    }
+  }));
+}
+
+const { project, previousProject, nextProject } = Astro.props as Props;
+const { Content } = await render(project);
+---
+
+<SiteLayout
+  title={`${project.data.title} | Projects | Qian Kevin`}
+  description={project.data.description}
+  type="article"
+>
+  <div class="site-page">
+    <div class="site-page-inner">
+      <PageIntro eyebrow="Project case study" title={project.data.title} description={project.data.description} />
+      <article class="article-detail">
+        {(project.data.role || project.data.period || project.data.technologies.length > 0) && (
+          <div class="project-meta">
+            {project.data.role && <p><strong>Role:</strong> {project.data.role}</p>}
+            {project.data.period && <p><strong>Period:</strong> {project.data.period}</p>}
+            {project.data.technologies.length > 0 && (
+              <ul class="article-taxonomies" aria-label="Technologies">
+                {project.data.technologies.map((technology) => <li><span>{technology}</span></li>)}
+              </ul>
+            )}
+          </div>
+        )}
+        <div class="article-body">
+          {project.body?.trim() ? <Content /> : (
+            <p class="empty-state">This case study has not been written yet.</p>
+          )}
+        </div>
+      </article>
+      {(previousProject || nextProject) && (
+        <nav class="article-pagination" aria-label="Project navigation">
+          {previousProject ? (
+            <a href={projectUrl(previousProject)}>
+              <span>Previous project</span>
+              <strong>{previousProject.data.title}</strong>
+            </a>
+          ) : <span aria-hidden="true"></span>}
+          {nextProject ? (
+            <a href={projectUrl(nextProject)}>
+              <span>Next project</span>
+              <strong>{nextProject.data.title}</strong>
+            </a>
+          ) : <span aria-hidden="true"></span>}
+        </nav>
+      )}
+    </div>
+  </div>
+</SiteLayout>

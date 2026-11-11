@@ -1,0 +1,34 @@
+---
+import { getCollection } from 'astro:content';
+import PageIntro from '../../components/PageIntro.astro';
+import ProjectCard from '../../components/ProjectCard.astro';
+import SiteLayout from '../../layouts/SiteLayout.astro';
+import { sortProjects } from '../../lib/projects';
+
+const projects = sortProjects(await getCollection('projects', ({ data }) => !data.draft));
+---
+
+<SiteLayout
+  title="Projects | Qian Kevin"
+  description="Technical case studies across software engineering, supply chain, and applied AI."
+>
+  <div class="site-page">
+    <div class="site-page-inner">
+      <PageIntro
+        eyebrow="Technical portfolio"
+        title="Projects"
+        description="Case studies focus on the problem, constraints, decisions, and evidence of impact - not just a list of tools."
+      />
+      {projects.length > 0 ? (
+        <section class="project-grid" aria-label="Project case studies">
+          {projects.map((project) => <ProjectCard project={project} />)}
+        </section>
+      ) : (
+        <section class="empty-state" aria-labelledby="projects-empty-title">
+          <h2 id="projects-empty-title">Project case studies are being prepared.</h2>
+          <p>No project details are published yet. This space is reserved for owner-approved work and outcomes.</p>
+        </section>
+      )}
+    </div>
+  </div>
+</SiteLayout>

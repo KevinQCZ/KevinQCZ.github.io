@@ -1,0 +1,19 @@
+---
+import { projectUrl, type Project } from '../lib/projects';
+
+interface Props {
+  project: Project;
+}
+
+const { project } = Astro.props;
+---
+
+<article class="project-card">
+  <h2><a href={projectUrl(project)}>{project.data.title}</a></h2>
+  <p>{project.data.description}</p>
+  {project.data.technologies.length > 0 && (
+    <ul class="article-taxonomies" aria-label="Technologies">
+      {project.data.technologies.map((technology) => <li><span>{technology}</span></li>)}
+    </ul>
+  )}
+</article>

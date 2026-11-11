@@ -1,0 +1,28 @@
+---
+import PageIntro from '../../components/PageIntro.astro';
+import SiteLayout from '../../layouts/SiteLayout.astro';
+---
+
+<SiteLayout
+  title="About | Qian Kevin"
+  description="About Qian Kevin and this professional knowledge hub."
+>
+  <section class="site-page">
+    <PageIntro
+      eyebrow="About"
+      title="Qian Kevin"
+      description="This site brings together practical work and ideas at the intersection of software engineering, supply chain, and applied AI."
+    />
+    <section class="site-section" aria-labelledby="site-purpose-title">
+      <h2 id="site-purpose-title">A place for useful work</h2>
+      <p>
+        Writing and project case studies will explain the context, trade-offs, and lessons behind the work.
+        Professional history and contact details can be added here when ready.
+      </p>
+      <div class="page-actions">
+        <a class="button-primary" href="/projects/">Explore projects</a>
+        <a class="button-secondary" href="/writing/">Read writing</a>
+      </div>
+    </section>
+  </section>
+</SiteLayout>

@@ -1,0 +1,99 @@
+---
+import { getCollection, render } from 'astro:content';
+import type { CollectionEntry } from 'astro:content';
+import PageIntro from '../components/PageIntro.astro';
+import SiteLayout from '../layouts/SiteLayout.astro';
+import {
+  articleUrl,
+  formatArticleDate,
+  sortArticles,
+  taxonomyUrl,
+  type Article
+} from '../lib/articles';
+
+interface Props {
+  article: Article;
+  newerArticle?: Article;
+  olderArticle?: Article;
+}
+
+export async function getStaticPaths() {
+  const articles = sortArticles(await getCollection('articles'));
+  return articles.map((article, index) => ({
+    params: { permalink: article.data.permalink },
+    props: {
+      article,
+      newerArticle: articles[index - 1],
+      olderArticle: articles[index + 1]
+    }
+  }));
+}
+
+const { article, newerArticle, olderArticle } = Astro.props as Props;
+const { Content, headings } = await render(article as CollectionEntry<'articles'>);
+const { title, description, publishedAt, categories, tags } = article.data;
+---
+
+<SiteLayout
+  title={`${title} | Qian Kevin`}
+  description={description}
+  type="article"
+  publishedTime={publishedAt}
+>
+  <div class="site-page article-page">
+    <div class="site-page-inner">
+      <PageIntro eyebrow="Writing" title={title} description={description} />
+      <article class="article-detail">
+        <div class="article-detail-meta">
+          <time datetime={publishedAt.toISOString()}>{formatArticleDate(publishedAt)}</time>
+          {(categories.length > 0 || tags.length > 0) && (
+            <ul class="article-taxonomies" aria-label="Topics">
+              {categories.map((category) => (
+                <li><a href={taxonomyUrl('categories', category)}>{category}</a></li>
+              ))}
+              {tags.map((tag) => (
+                <li><a href={taxonomyUrl('tags', tag)}>#{tag}</a></li>
+              ))}
+            </ul>
+          )}
+        </div>
+
+        {headings.length > 0 && (
+          <nav class="table-of-contents" aria-labelledby="toc-title">
+            <h2 id="toc-title">On this page</h2>
+            <ol>
+              {headings.map((heading) => (
+                <li class={`toc-level-${heading.depth}`}>
+                  <a href={`#${heading.slug}`}>{heading.text}</a>
+                </li>
+              ))}
+            </ol>
+          </nav>
+        )}
+
+        <div class="article-body">
+          {article.body?.trim() ? (
+            <Content />
+          ) : (
+            <p class="empty-state">This archived post has no published body.</p>
+          )}
+        </div>
+      </article>
+
+      <nav class="article-pagination" aria-label="Article navigation">
+        {newerArticle ? (
+          <a href={articleUrl(newerArticle)}>
+            <span>Newer article</span>
+            <strong>{newerArticle.data.title}</strong>
+          </a>
+        ) : <span aria-hidden="true"></span>}
+        {olderArticle ? (
+          <a href={articleUrl(olderArticle)}>
+            <span>Older article</span>
+            <strong>{olderArticle.data.title}</strong>
+          </a>
+        ) : <span aria-hidden="true"></span>}
+      </nav>
+    </div>
+  </div>
+</SiteLayout>

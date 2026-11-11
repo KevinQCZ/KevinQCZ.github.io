@@ -1,0 +1,54 @@
+---
+import { getCollection } from 'astro:content';
+import ArticleList from '../../components/ArticleList.astro';
+import PageIntro from '../../components/PageIntro.astro';
+import SiteLayout from '../../layouts/SiteLayout.astro';
+import { sortArticles } from '../../lib/articles';
+
+const articles = sortArticles(await getCollection('articles'));
+
+export async function getStaticPaths() {
+  const articles = sortArticles(await getCollection('articles'));
+  const years = new Set<string>();
+  const months = new Set<string>();
+
+  for (const article of articles) {
+    const date = article.data.publishedAt;
+    const year = String(date.getUTCFullYear());
+    years.add(year);
+    months.add(`${year}/${String(date.getUTCMonth() + 1).padStart(2, '0')}`);
+  }
+
+  return [
+    ...[...years].map((year) => ({ params: { period: year } })),
+    ...[...months].map((period) => ({ params: { period } }))
+  ];
+}
+
+const parts = Astro.params.period?.split('/') ?? [];
+const year = Number(parts[0]);
+const month = parts[1] ? Number(parts[1]) : undefined;
+const filteredArticles = articles.filter((article) => {
+  const date = article.data.publishedAt;
+  return date.getUTCFullYear() === year &&
+    (month === undefined || date.getUTCMonth() + 1 === month);
+});
+const title = month === undefined
+  ? `Archive: ${year}`
+  : `Archive: ${new Intl.DateTimeFormat('en', {
+      month: 'long',
+      timeZone: 'UTC'
+    }).format(new Date(Date.UTC(year, month - 1, 1)))} ${year}`;
+---
+
+<SiteLayout
+  title={`${title} | Qian Kevin`}
+  description={`Articles published ${month === undefined ? `in ${year}` : `in ${title.replace('Archive: ', '')}`}.`}
+>
+  <div class="site-page">
+    <div class="site-page-inner">
+      <PageIntro eyebrow="Writing archive" title={title} />
+      <ArticleList articles={filteredArticles} />
+    </div>
+  </div>
+</SiteLayout>
