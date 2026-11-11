@@ -50,3 +50,11 @@ Copy `src/content/projects/_template.mdx` to a new `.md` or `.mdx` file in the s
 ## Deployment
 
 GitHub Actions builds and deploys `dist/`. The repository's GitHub Pages source must be set to **GitHub Actions** for workflow deployments to take effect.
+
+If the generated **pages build and deployment** workflow fails with `Invalid YAML front matter` in an `.astro` file, GitHub Pages is using its Jekyll builder instead of the Astro workflow. To fix this:
+
+1. Open the repository's **Settings → Pages → Build and deployment**.
+2. Set **Source** to **GitHub Actions**. Keep the existing `.github/workflows/deploy.yml`; no template workflow is needed.
+3. Under **Actions → Build and deploy GitHub Pages**, choose **Run workflow** on `master`.
+
+Re-running the failed Jekyll job will not switch builders. This is a repository setting, not a source-code error; adding `.nojekyll` would not compile the Astro site.
