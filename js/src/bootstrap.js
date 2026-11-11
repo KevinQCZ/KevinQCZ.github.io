@@ -20,6 +20,7 @@ $(document).ready(function () {
     var animateAction = isSiteNavOn ? 'slideUp' : 'slideDown';
     var animateCallback = isSiteNavOn ? 'removeClass' : 'addClass';
 
+    $(this).attr('aria-expanded', isSiteNavOn ? 'false' : 'true');
     $siteNav.stop()[animateAction]('fast', function () {
       $siteNav[animateCallback](ON_CLASS_NAME);
     });
