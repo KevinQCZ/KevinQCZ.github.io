@@ -14,12 +14,16 @@ export function articleUrl(article: Article): string {
   return `/${article.data.permalink}/`;
 }
 
+export function hasPublishedBody(article: Pick<Article, 'body'>): boolean {
+  return Boolean(article.body?.trim());
+}
+
 export function taxonomySlug(value: string): string {
   return value
     .normalize('NFKD')
     .toLowerCase()
     .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/[^\p{L}\p{N}]+/gu, '-')
     .replace(/^-|-$/g, '');
 }
 
@@ -29,8 +33,26 @@ export function taxonomyUrl(kind: TaxonomyKind, value: string): string {
 }
 
 export function uniqueTaxonomies(articles: Article[], kind: TaxonomyKind): string[] {
-  return [...new Set(articles.flatMap((article) => article.data[kind]))]
+  const taxonomies = [...new Set(articles.flatMap((article) => article.data[kind]))]
     .sort((a, b) => a.localeCompare(b));
+  const slugs = new Map<string, string>();
+
+  for (const taxonomy of taxonomies) {
+    const slug = taxonomySlug(taxonomy);
+    if (!slug) {
+      throw new Error(`Taxonomy labels must not be empty (${kind}).`);
+    }
+
+    const existing = slugs.get(slug);
+    if (existing && existing !== taxonomy) {
+      throw new Error(
+        `Taxonomy slug collision in ${kind}: "${existing}" and "${taxonomy}" both map to "${slug}".`
+      );
+    }
+    slugs.set(slug, taxonomy);
+  }
+
+  return taxonomies;
 }
 
 export function formatArticleDate(date: Date): string {

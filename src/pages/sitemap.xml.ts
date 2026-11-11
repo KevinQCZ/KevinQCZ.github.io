@@ -2,6 +2,7 @@ import { getCollection } from 'astro:content';
 import type { APIRoute } from 'astro';
 import {
   articleUrl,
+  hasPublishedBody,
   sortArticles,
   taxonomyUrl,
   uniqueTaxonomies
@@ -17,7 +18,7 @@ export const GET: APIRoute = async ({ site }) => {
     throw new Error('Set the site URL in astro.config.mjs before building the sitemap.');
   }
 
-  const articles = sortArticles(await getCollection('articles'));
+  const articles = sortArticles(await getCollection('articles')).filter(hasPublishedBody);
   const projects = sortProjects(await getCollection('projects', ({ data }) => !data.draft));
   const routes = new Set([
     '/',

@@ -9,6 +9,7 @@ const requiredRoutes = [
   'about/index.html',
   'writing/index.html',
   'writing/search/index.html',
+  'writing/search/index.json',
   'writing/categories/software-engineering/index.html',
   'writing/tags/hexo/index.html',
   'projects/index.html',
@@ -32,6 +33,7 @@ const requiredContent = new Map([
   ['writing/search/index.html', [
     'data-writing-search',
     'data-search-entry',
+    'data-search-href',
     '/js/writing-search.js'
   ]],
   ['projects/index.html', [
@@ -60,10 +62,12 @@ const requiredContent = new Map([
     '<meta property="article:published_time" content="2018-02-07T00:00:00.000Z">',
     '<nav class="table-of-contents"',
     'href="#quick-start"',
+    'https://hexo.io/docs/one-command-deployment',
     'href="/2018/02/07/My-first-Test-Article/"'
   ]],
   ['2018/02/07/My-first-Test-Article/index.html', [
-    'This archived post has no published body.'
+    'This archived post has no published body.',
+    '<meta name="robots" content="noindex,follow">'
   ]]
 ]);
 
@@ -149,6 +153,44 @@ for (const [route, markers] of requiredContent) {
   }
 }
 
+const emptyArticleUrl = `${siteOrigin}/2018/02/07/My-first-Test-Article/`;
+for (const route of ['sitemap.xml', 'rss.xml']) {
+  const contents = await readFile(path.join(outputDirectory, route), 'utf8');
+  if (contents.includes(emptyArticleUrl)) {
+    errors.push(`${route}: empty archived article must not be published in discovery feeds`);
+  }
+}
+
+const searchIndexPath = path.join(outputDirectory, 'writing', 'search', 'index.json');
+if (await exists(searchIndexPath)) {
+  try {
+    const searchIndex = JSON.parse(await readFile(searchIndexPath, 'utf8'));
+    if (!Array.isArray(searchIndex) || !searchIndex.every(
+      (record) => typeof record.href === 'string' && typeof record.body === 'string'
+    )) {
+      errors.push('writing/search/index.json: invalid search-index record shape');
+    } else {
+      if (searchIndex.some((record) => record.href === '/2018/02/07/My-first-Test-Article/')) {
+        errors.push('writing/search/index.json: empty archived article must not be searchable');
+      }
+      if (!searchIndex.some((record) => record.href === '/2018/02/07/hello-world/' &&
+        record.body.includes('Welcome to'))) {
+        errors.push('writing/search/index.json: published article body is missing from full-text search');
+      }
+    }
+  } catch (error) {
+    errors.push(`writing/search/index.json: invalid JSON (${error.message})`);
+  }
+}
+
+const searchPage = await readFile(
+  path.join(outputDirectory, 'writing', 'search', 'index.html'),
+  'utf8'
+);
+if (searchPage.includes('Welcome to Hexo')) {
+  errors.push('writing/search/index.html: full article body should not be embedded in the initial page');
+}
+
 for (const filePath of htmlFiles) {
   const html = await readFile(filePath, 'utf8');
   const relativePath = path.relative(outputDirectory, filePath).split(path.sep).join('/');
@@ -169,8 +211,28 @@ for (const filePath of htmlFiles) {
       !/<meta\b[^>]*\bname=["']twitter:description["'][^>]*>/i.test(html)) {
     errors.push(`${relativePath}: missing page-specific Twitter title or description`);
   }
-
+  const ogImageTag = html.match(/<meta\b[^>]*\bproperty=["']og:image["'][^>]*>/i)?.[0];
+  const ogImage = ogImageTag ? attribute(ogImageTag, 'content') : null;
+  const twitterImageTag = html.match(/<meta\b[^>]*\bname=["']twitter:image["'][^>]*>/i)?.[0];
+  const twitterImage = twitterImageTag ? attribute(twitterImageTag, 'content') : null;
   const pageUrl = new URL(relativePath, `${siteOrigin}/`);
+  if (!ogImage || ogImage !== twitterImage) {
+    errors.push(`${relativePath}: Open Graph and Twitter images are missing or do not match`);
+  } else {
+    const imageUrl = new URL(ogImage, pageUrl);
+    if (imageUrl.origin === siteOrigin) {
+      const candidates = targetCandidates(imageUrl);
+      const candidatesExist = await Promise.all(candidates.map((candidate) => exists(candidate)));
+      if (!candidatesExist.some(Boolean)) {
+        errors.push(`${relativePath}: unresolved social image "${ogImage}"`);
+      }
+    }
+  }
+  if (!/<meta\b[^>]*\bproperty=["']og:image:width["'][^>]*\bcontent=["']1200["']/i.test(html) ||
+      !/<meta\b[^>]*\bproperty=["']og:image:height["'][^>]*\bcontent=["']630["']/i.test(html)) {
+    errors.push(`${relativePath}: social image dimensions must be 1200x630`);
+  }
+
   for (const { tag, value } of extractReferences(html)) {
     if (/^(?:mailto:|tel:|javascript:|data:|blob:)/i.test(value)) continue;
 

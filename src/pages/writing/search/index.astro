@@ -2,9 +2,14 @@
 import { getCollection } from 'astro:content';
 import PageIntro from '../../../components/PageIntro.astro';
 import SiteLayout from '../../../layouts/SiteLayout.astro';
-import { articleUrl, formatArticleDate, sortArticles } from '../../../lib/articles';
+import {
+  articleUrl,
+  formatArticleDate,
+  hasPublishedBody,
+  sortArticles
+} from '../../../lib/articles';
 
-const articles = sortArticles(await getCollection('articles'));
+const articles = sortArticles(await getCollection('articles')).filter(hasPublishedBody);
 const initialQuery = Astro.url.searchParams.get('q') ?? '';
 ---
 
@@ -39,7 +44,8 @@ const initialQuery = Astro.url.searchParams.get('q') ?? '';
         {articles.map((article) => (
           <li
             data-search-entry
-            data-search-text={`${article.data.title} ${article.data.description} ${article.body ?? ''}`}
+            data-search-href={articleUrl(article)}
+            data-search-text={`${article.data.title} ${article.data.description}`}
           >
             <time datetime={article.data.publishedAt.toISOString().slice(0, 10)}>
               {formatArticleDate(article.data.publishedAt)}

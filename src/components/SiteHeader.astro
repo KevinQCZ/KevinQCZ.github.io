@@ -1,4 +1,6 @@
 ---
+import { isCurrentNavigationLink } from '../lib/navigation';
+
 interface Props {
   lang?: 'en' | 'zh-Hans';
 }
@@ -59,7 +61,10 @@ const links = isChinese
       <ul class="menu">
         {links.map((link) => (
           <li class="menu-item">
-            <a href={link.href} aria-current={currentPath === link.href ? 'page' : undefined}>
+            <a
+              href={link.href}
+              aria-current={isCurrentNavigationLink(link.href, currentPath) ? 'page' : undefined}
+            >
               {link.label}
             </a>
           </li>
