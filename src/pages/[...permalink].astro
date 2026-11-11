@@ -6,6 +6,7 @@ import SiteLayout from '../layouts/SiteLayout.astro';
 import {
   articleUrl,
   formatArticleDate,
+  hasPublishedBody,
   sortArticles,
   taxonomyUrl,
   type Article
@@ -39,6 +40,7 @@ const { title, description, publishedAt, categories, tags } = article.data;
   description={description}
   type="article"
   publishedTime={publishedAt}
+  noindex={!hasPublishedBody(article)}
 >
   <div class="site-page article-page">
     <div class="site-page-inner">
@@ -72,7 +74,7 @@ const { title, description, publishedAt, categories, tags } = article.data;
         )}
 
         <div class="article-body">
-          {article.body?.trim() ? (
+          {hasPublishedBody(article) ? (
             <Content />
           ) : (
             <p class="empty-state">This archived post has no published body.</p>

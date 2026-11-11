@@ -703,6 +703,12 @@ a {
   height: auto;
 }
 
+.article-body table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
 .article-body blockquote {
   margin-left: 0;
   border-left: 3px solid var(--accent);

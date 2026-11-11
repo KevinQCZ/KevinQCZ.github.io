@@ -1,6 +1,6 @@
 import { getCollection } from 'astro:content';
 import type { APIRoute } from 'astro';
-import { articleUrl, sortArticles } from '../lib/articles';
+import { articleUrl, hasPublishedBody, sortArticles } from '../lib/articles';
 import { escapeXml } from '../lib/xml';
 
 export const prerender = true;
@@ -10,7 +10,7 @@ export const GET: APIRoute = async ({ site }) => {
     throw new Error('Set the site URL in astro.config.mjs before building the RSS feed.');
   }
 
-  const articles = sortArticles(await getCollection('articles'));
+  const articles = sortArticles(await getCollection('articles')).filter(hasPublishedBody);
   const channelUrl = new URL('/writing/', site).href;
   const feedUrl = new URL('/rss.xml', site).href;
   const items = articles.map((article) => {
