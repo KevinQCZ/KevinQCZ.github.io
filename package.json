@@ -9,8 +9,10 @@
     "dev": "astro dev",
     "build": "astro build && npm run validate",
     "preview": "astro preview",
-    "check": "astro check",
-    "test": "node --test scripts/*.test.mjs && node --check public/js/writing-search.js",
+    "check": "astro check && npm run check:worker",
+    "check:worker": "tsc -p worker/tsconfig.json --noEmit",
+    "test": "node --test scripts/*.test.mjs && node --check public/js/writing-search.js && npm run test:worker",
+    "test:worker": "vitest run --config worker/vitest.config.ts",
     "validate": "node scripts/validate-site.mjs"
   },
   "dependencies": {
@@ -19,6 +21,10 @@
   },
   "devDependencies": {
     "@astrojs/check": "^0.9.12",
-    "typescript": "^6.0.3"
+    "@cloudflare/vitest-plugin": "1.8.0",
+    "@cloudflare/workers-types": "5.20261112.1",
+    "typescript": "^6.0.3",
+    "vitest": "5.1.0",
+    "wrangler": "4.160.1"
   }
 }

@@ -1,0 +1,22 @@
+---
+import SiteLayout from '../../layouts/SiteLayout.astro';
+const apiOrigin = import.meta.env.PUBLIC_AUTH_API_ORIGIN ?? '';
+---
+
+<SiteLayout title="Admin | Qian Kevin" description="Administrator sign-in." noindex>
+  <section class="site-page">
+    <div class="site-section">
+      <h1>Administrator</h1>
+      <div id="admin-session" data-api-origin={apiOrigin}>
+        <p data-status role="status">Sign-in is unavailable without JavaScript.</p>
+        <button class="button-primary" data-login type="button" hidden>Sign in with GitHub</button>
+        <button class="button-secondary" data-logout type="button" hidden>Sign out</button>
+      </div>
+    </div>
+  </section>
+  <script>
+    import { initAdmin } from '../../../public/js/admin.js';
+    const root = document.querySelector<HTMLElement>('#admin-session');
+    if (root) initAdmin(root);
+  </script>
+</SiteLayout>

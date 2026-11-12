@@ -1,0 +1,6 @@
+SITE_ORIGIN=https://site.example.test
+API_ORIGIN=https://api.example.test
+GITHUB_CLIENT_ID=replace-with-local-client-id
+GITHUB_CLIENT_SECRET=replace-with-local-client-secret
+ADMIN_GITHUB_IDS=replace-with-numeric-ids
+CSRF_SECRET=replace-with-at-least-32-random-characters

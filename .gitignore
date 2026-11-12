@@ -2,3 +2,7 @@ node_modules/
 dist/
 .astro/
 npm-debug.log*
+.wrangler/
+worker/.dev.vars*
+worker/.env*
+!worker/.dev.vars.example
