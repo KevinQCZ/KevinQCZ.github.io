@@ -35,11 +35,19 @@ test('authorized session uses in-memory CSRF and handles logout failure', async 
   const { root, elements } = fixture();
   let request;
   await initAdmin(root, async (url, options) => {
-    if (url.endsWith('/api/me')) return { ok: true, json: async () => ({ role: 'ADMIN', csrfToken: 'csrf-token' }) };
+    if (url.endsWith('/api/me')) return {
+      ok: true,
+      json: async () => ({
+        authenticated: true,
+        user: { githubId: '123', githubLogin: 'approved-user', role: 'ADMIN' },
+        csrfToken: 'csrf-token'
+      })
+    };
     request = options;
     return { ok: false };
   });
   assert.equal(elements.logout.hidden, false);
+  assert.match(elements.status.textContent, /approved-user \(ADMIN\)/);
   await elements.logout.click();
   assert.equal(request.credentials, 'include');
   assert.equal(request.headers['X-CSRF-Token'], 'csrf-token');
@@ -50,7 +58,14 @@ test('authorized session uses in-memory CSRF and handles logout failure', async 
 test('successful logout clears admin controls', async () => {
   const { root, elements } = fixture();
   await initAdmin(root, async (url) => url.endsWith('/api/me')
-    ? { ok: true, json: async () => ({ role: 'ADMIN', csrfToken: 'csrf-token' }) }
+    ? {
+      ok: true,
+      json: async () => ({
+        authenticated: true,
+        user: { githubId: '123', githubLogin: 'approved-user', role: 'ADMIN' },
+        csrfToken: 'csrf-token'
+      })
+    }
     : { ok: true });
   await elements.logout.click();
   assert.match(elements.status.textContent, /Signed out/);

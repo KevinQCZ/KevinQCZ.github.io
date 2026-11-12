@@ -22,7 +22,16 @@ interface Config {
 interface Session {
   id: string;
   github_user_id: string;
+  github_login: string;
   session_hash: string;
+  expires_at: number;
+  created_at: number;
+  last_used_at: number;
+}
+
+interface AuthContext {
+  session: Session;
+  token: string;
 }
 
 const SESSION_COOKIE = '__Host-admin_session';
@@ -121,15 +130,49 @@ async function limit(request: Request, binding: RateLimit, endpoint: string): Pr
   return (await binding.limit({ key: `${endpoint}:${ip}` })).success;
 }
 
-async function session(request: Request, env: Env, cfg: Config): Promise<{ session: Session; token: string } | 401 | 403> {
+export async function requireAuthentication(
+  request: Request,
+  env: Env,
+  cfg: Config
+): Promise<AuthContext | Response> {
   const token = cookieValue(request, SESSION_COOKIE);
-  if (!token) return 401;
+  if (!token) return error(request, cfg, 401, 'unauthorized');
+  const now = Date.now();
   const record = await env.DB.prepare(
-    'SELECT id, github_user_id, session_hash FROM admin_sessions WHERE session_hash = ? AND expires_at > ?'
-  ).bind(await hash(token), Date.now()).first<Session>();
-  if (!record) return 401;
-  if (!cfg.allowedIds.has(record.github_user_id)) return 403;
+    `UPDATE admin_sessions SET last_used_at = ?
+     WHERE session_hash = ? AND expires_at > ?
+     RETURNING id, github_user_id, github_login, session_hash, expires_at, created_at, last_used_at`
+  ).bind(now, await hash(token), now).first<Session>();
+  if (!record || !record.github_login) return error(request, cfg, 401, 'unauthorized');
   return { session: record, token };
+}
+
+export function requireAdmin(
+  request: Request,
+  auth: AuthContext,
+  cfg: Config
+): Response | null {
+  return cfg.allowedIds.has(auth.session.github_user_id)
+    ? null
+    : error(request, cfg, 403, 'forbidden');
+}
+
+export async function requireCsrfProtection(
+  request: Request,
+  auth: AuthContext,
+  cfg: Config
+): Promise<Response | null> {
+  const supplied = request.headers.get('X-CSRF-Token') || '';
+  const expected = await csrf(auth.token, cfg.csrfSecret);
+  const suppliedBytes = encoder.encode(supplied);
+  const expectedBytes = encoder.encode(expected);
+  let difference = suppliedBytes.length ^ expectedBytes.length;
+  for (let i = 0; i < Math.max(suppliedBytes.length, expectedBytes.length); i += 1) {
+    difference |= (suppliedBytes[i] || 0) ^ (expectedBytes[i] || 0);
+  }
+  return validUnsafeRequest(request, cfg) && difference === 0
+    ? null
+    : error(request, cfg, 403, 'forbidden');
 }
 
 async function audit(env: Env, action: string, result: string, userId: string | null = null): Promise<void> {
@@ -221,10 +264,13 @@ async function callback(request: Request, env: Env, cfg: Config): Promise<Respon
   if (!identity.ok) return error(request, cfg, 502, 'provider_unavailable');
   const user = await providerJson(identity);
   if (!user || typeof user !== 'object' || !('id' in user) ||
-      typeof user.id !== 'number' || !Number.isSafeInteger(user.id) || user.id <= 0) {
+      typeof user.id !== 'number' || !Number.isSafeInteger(user.id) || user.id <= 0 ||
+      !('login' in user) || typeof user.login !== 'string' ||
+      user.login.length > 39 || !/^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/.test(user.login)) {
     return error(request, cfg, 502, 'invalid_provider_identity');
   }
   const userId = String(user.id);
+  const login = user.login;
   if (!cfg.allowedIds.has(userId)) {
     await audit(env, 'login', 'denied', userId);
     return error(request, cfg, 403, 'forbidden');
@@ -235,8 +281,8 @@ async function callback(request: Request, env: Env, cfg: Config): Promise<Respon
   const statements = [];
   if (oldToken) statements.push(env.DB.prepare('DELETE FROM admin_sessions WHERE session_hash = ?').bind(await hash(oldToken)));
   statements.push(
-    env.DB.prepare('INSERT INTO admin_sessions (id, github_user_id, session_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)')
-      .bind(crypto.randomUUID(), userId, await hash(newToken), now + SESSION_SECONDS * 1000, now),
+    env.DB.prepare('INSERT INTO admin_sessions (id, github_user_id, github_login, session_hash, expires_at, created_at, last_used_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .bind(crypto.randomUUID(), userId, login, await hash(newToken), now + SESSION_SECONDS * 1000, now, now),
     env.DB.prepare('INSERT INTO audit_logs (id, github_user_id, action, created_at, result) VALUES (?, ?, ?, ?, ?)')
       .bind(crypto.randomUUID(), userId, 'login', now, 'success')
   );
@@ -271,16 +317,28 @@ async function handle(request: Request, env: Env, cfg: Config): Promise<Response
   }
   if (path === '/auth/github' && request.method === 'GET') return start(request, env, cfg);
   if (path === '/auth/github/callback' && request.method === 'GET') return callback(request, env, cfg);
-  if (path === '/api/me' || path === '/api/logout' || path.startsWith('/api/admin/')) {
-    const auth = await session(request, env, cfg);
-    if (typeof auth === 'number') return error(request, cfg, auth, auth === 401 ? 'unauthorized' : 'forbidden');
+  if (
+    path === '/api/me' || path === '/api/logout' ||
+    path === '/api/admin' || path.startsWith('/api/admin/')
+  ) {
+    const auth = await requireAuthentication(request, env, cfg);
+    if (auth instanceof Response) return auth;
+    const adminError = requireAdmin(request, auth, cfg);
+    if (adminError) return adminError;
     if (path === '/api/me' && request.method === 'GET') {
-      return json(request, cfg, 200, { role: 'ADMIN', githubUserId: auth.session.github_user_id, csrfToken: await csrf(auth.token, cfg.csrfSecret) });
+      return json(request, cfg, 200, {
+        authenticated: true,
+        user: {
+          githubId: auth.session.github_user_id,
+          githubLogin: auth.session.github_login,
+          role: 'ADMIN'
+        },
+        csrfToken: await csrf(auth.token, cfg.csrfSecret)
+      });
     }
     if (path === '/api/logout' && request.method === 'POST') {
-      if (!validUnsafeRequest(request, cfg) || request.headers.get('X-CSRF-Token') !== await csrf(auth.token, cfg.csrfSecret)) {
-        return error(request, cfg, 403, 'forbidden');
-      }
+      const csrfError = await requireCsrfProtection(request, auth, cfg);
+      if (csrfError) return csrfError;
       if (!await limit(request, env.WRITE_RATE_LIMITER, 'logout')) return error(request, cfg, 429, 'rate_limited');
       const [deleted] = await env.DB.batch([
         env.DB.prepare('DELETE FROM admin_sessions WHERE id = ? AND session_hash = ? AND expires_at > ?')

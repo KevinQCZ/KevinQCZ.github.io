@@ -51,11 +51,15 @@ export function initAdmin(root, fetcher = fetch, navigate = (url) => window.loca
         show('This account is not authorized.');
       } else if (response.ok) {
         const data = await response.json();
-        if (data.role !== 'ADMIN' || typeof data.csrfToken !== 'string' || !data.csrfToken) {
+        if (
+          data.authenticated !== true || data.user?.role !== 'ADMIN' ||
+          typeof data.user.githubId !== 'string' || typeof data.user.githubLogin !== 'string' ||
+          !data.user.githubLogin || typeof data.csrfToken !== 'string' || !data.csrfToken
+        ) {
           throw new Error('Invalid session response');
         }
         token = data.csrfToken;
-        show('Signed in as administrator.', false, true);
+        show(`Signed in as ${data.user.githubLogin} (ADMIN).`, false, true);
       } else {
         throw new Error('Session check failed');
       }
