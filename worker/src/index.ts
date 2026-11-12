@@ -1,3 +1,13 @@
+import { articleMetadataSchema } from '../../src/lib/article-schema';
+import {
+  getPublishedArticle,
+  listPublishedArticles,
+  publishedArticleConflicts,
+  validArticlePath,
+  type GitHubAppConfig,
+  type PublishedArticle
+} from './github';
+
 interface Env {
   DB: D1Database;
   AUTH_RATE_LIMITER: RateLimit;
@@ -8,6 +18,9 @@ interface Env {
   GITHUB_CLIENT_SECRET: string;
   ADMIN_GITHUB_IDS: string;
   CSRF_SECRET: string;
+  GITHUB_APP_ID?: string;
+  GITHUB_APP_INSTALLATION_ID?: string;
+  GITHUB_APP_PRIVATE_KEY?: string;
 }
 
 interface Config {
@@ -17,6 +30,7 @@ interface Config {
   clientSecret: string;
   allowedIds: Set<string>;
   csrfSecret: string;
+  githubApp: GitHubAppConfig | null;
 }
 
 interface Session {
@@ -46,13 +60,47 @@ interface ArticleDraft {
   expectedRevision: number | null;
 }
 
+interface ManagedDraftInput extends ArticleDraft {
+  permalink: string;
+  articleId: string | null;
+}
+
 interface StoredArticleDraft extends Omit<ArticleDraft, 'expectedRevision' | 'coverUrl'> {
+  id: string;
+  articlePath: string | null;
+  baseSha: string | null;
+  status: 'DRAFT';
   permalink: string;
   coverUrl: string | null;
   revision: number;
   createdAt: number;
   updatedAt: number;
 }
+
+interface DraftRow {
+  id: string;
+  article_path: string | null;
+  base_sha: string | null;
+  status: 'DRAFT';
+  permalink: string;
+  source_format: 'md' | 'mdx';
+  title: string;
+  description: string;
+  published_at: string;
+  categories_json: string;
+  tags_json: string;
+  cover_url: string | null;
+  body: string;
+  revision: number;
+  created_at: number;
+  updated_at: number;
+  created_by: string | null;
+  updated_by: string | null;
+}
+
+const DRAFT_COLUMNS = `id, article_path, base_sha, status, permalink, source_format, title,
+  description, published_at, categories_json, tags_json, cover_url, body, revision,
+  created_at, updated_at, created_by, updated_by`;
 
 const SESSION_COOKIE = '__Host-admin_session';
 const TRANSACTION_COOKIE = '__Host-oauth_transaction';
@@ -74,14 +122,22 @@ function config(env: Env): Config {
   const site = origin(env.SITE_ORIGIN);
   const api = origin(env.API_ORIGIN);
   const ids = typeof env.ADMIN_GITHUB_IDS === 'string' ? env.ADMIN_GITHUB_IDS.split(',') : [];
+  const githubAppValues = [env.GITHUB_APP_ID, env.GITHUB_APP_INSTALLATION_ID, env.GITHUB_APP_PRIVATE_KEY];
+  const hasGitHubAppConfig = githubAppValues.some((value) => Boolean(value?.trim()));
   if (
     site === api || !env.GITHUB_CLIENT_ID?.trim() || !env.GITHUB_CLIENT_SECRET?.trim() ||
     !env.CSRF_SECRET || encoder.encode(env.CSRF_SECRET).length < 32 ||
-    !ids.length || ids.some((id) => !/^[1-9]\d*$/.test(id))
+    !ids.length || ids.some((id) => !/^[1-9]\d*$/.test(id)) ||
+    (hasGitHubAppConfig && githubAppValues.some((value) => !value?.trim()))
   ) throw new Error('Invalid authentication configuration');
   return {
     site, api, clientId: env.GITHUB_CLIENT_ID, clientSecret: env.GITHUB_CLIENT_SECRET,
-    allowedIds: new Set(ids), csrfSecret: env.CSRF_SECRET
+    allowedIds: new Set(ids), csrfSecret: env.CSRF_SECRET,
+    githubApp: hasGitHubAppConfig ? {
+      appId: env.GITHUB_APP_ID!,
+      installationId: env.GITHUB_APP_INSTALLATION_ID!,
+      privateKey: env.GITHUB_APP_PRIVATE_KEY!.replace(/\\n/g, '\n')
+    } : null
   };
 }
 
@@ -202,6 +258,235 @@ async function audit(env: Env, action: string, result: string, userId: string | 
     .bind(crypto.randomUUID(), userId, action, Date.now(), result).run();
 }
 
+async function auditDraft(
+  env: Env,
+  userId: string,
+  action: string,
+  draftId: string,
+  result = 'success'
+): Promise<void> {
+  await env.DB.prepare(
+    `INSERT INTO audit_logs
+     (id, github_user_id, action, created_at, result, resource_type, resource_id)
+     VALUES (?, ?, ?, ?, ?, 'draft', ?)`
+  ).bind(crypto.randomUUID(), userId, action, Date.now(), result, draftId).run();
+}
+
+function draftSummary(row: DraftRow) {
+  const { body: _body, ...draft } = storedDraft(row);
+  return draft;
+}
+
+function sourceUnavailable(request: Request, cfg: Config): Response {
+  return error(request, cfg, 503, 'github_source_unavailable');
+}
+
+async function adminArticleList(request: Request, env: Env, cfg: Config): Promise<Response> {
+  let articles: Awaited<ReturnType<typeof listPublishedArticles>> = [];
+  let publishedSourceError: 'not_configured' | 'unavailable' | null =
+    cfg.githubApp ? null : 'not_configured';
+  if (cfg.githubApp) {
+    try {
+      articles = await listPublishedArticles(cfg.githubApp);
+    } catch {
+      publishedSourceError = 'unavailable';
+    }
+  }
+  const drafts = await env.DB.prepare(
+    `SELECT ${DRAFT_COLUMNS} FROM article_drafts
+     WHERE status = 'DRAFT' ORDER BY updated_at DESC LIMIT 200`
+  ).all<DraftRow>();
+  return json(request, cfg, 200, {
+    articles,
+    drafts: drafts.results.map(draftSummary),
+    publishedSourceAvailable: publishedSourceError === null,
+    publishedSourceError
+  });
+}
+
+async function adminArticleDetail(
+  request: Request,
+  env: Env,
+  cfg: Config,
+  id: string,
+  userId: string
+): Promise<Response> {
+  if (/^d_[a-f0-9-]{32,36}$/i.test(id)) {
+    const row = await env.DB.prepare(
+      `SELECT ${DRAFT_COLUMNS} FROM article_drafts WHERE id = ? AND status = 'DRAFT'`
+    ).bind(id.slice(2)).first<DraftRow>();
+    if (!row) return error(request, cfg, 404, 'not_found');
+    await auditDraft(env, userId, 'draft.preview', row.id);
+    return json(request, cfg, 200, { draft: storedDraft(row) });
+  }
+  if (!/^a_[A-Za-z0-9_-]{22}$/.test(id)) return error(request, cfg, 404, 'not_found');
+  if (!cfg.githubApp) return sourceUnavailable(request, cfg);
+  let article: PublishedArticle | null;
+  try {
+    article = await getPublishedArticle(cfg.githubApp, id);
+  } catch {
+    return sourceUnavailable(request, cfg);
+  }
+  if (!article) return error(request, cfg, 404, 'not_found');
+  const row = await env.DB.prepare(
+    `SELECT ${DRAFT_COLUMNS} FROM article_drafts
+     WHERE article_path = ? OR permalink = ?
+     ORDER BY CASE WHEN article_path = ? THEN 0 ELSE 1 END LIMIT 1`
+  ).bind(article.articlePath, article.permalink, article.articlePath).first<DraftRow>();
+  if (row) await auditDraft(env, userId, 'draft.preview', row.id);
+  return json(request, cfg, 200, {
+    article,
+    draft: row ? storedDraft(row) : null
+  });
+}
+
+async function createManagedDraft(
+  request: Request,
+  env: Env,
+  cfg: Config,
+  userId: string,
+  payload: unknown
+): Promise<Response> {
+  if (!cfg.githubApp) return sourceUnavailable(request, cfg);
+  const input = parseManagedDraft(payload);
+  if (!input || input.expectedRevision !== null) return error(request, cfg, 400, 'invalid_draft');
+
+  let articlePath: string;
+  let baseSha: string | null = null;
+  let sourceFormat: ArticleDraft['sourceFormat'] = input.sourceFormat;
+  if (input.articleId) {
+    let published: PublishedArticle | null;
+    try {
+      published = await getPublishedArticle(cfg.githubApp, input.articleId);
+    } catch {
+      return sourceUnavailable(request, cfg);
+    }
+    if (!published) return error(request, cfg, 404, 'not_found');
+    if (published.permalink !== input.permalink || published.sourceFormat !== input.sourceFormat) {
+      return error(request, cfg, 400, 'invalid_draft');
+    }
+    articlePath = published.articlePath;
+    baseSha = published.sha;
+    sourceFormat = published.sourceFormat;
+  } else {
+    const slug = input.permalink.split('/').at(-1)!;
+    articlePath = `src/content/articles/${slug}.${sourceFormat}`;
+    if (!validArticlePath(articlePath)) return error(request, cfg, 400, 'invalid_article_path');
+    try {
+      const conflicts = await publishedArticleConflicts(cfg.githubApp, input.permalink, articlePath);
+      if (conflicts.permalinkExists || conflicts.pathExists) {
+        return error(request, cfg, 409, 'article_conflict');
+      }
+    } catch {
+      return sourceUnavailable(request, cfg);
+    }
+  }
+
+  const existing = await env.DB.prepare(
+    'SELECT id FROM article_drafts WHERE permalink = ? OR article_path = ? LIMIT 1'
+  ).bind(input.permalink, articlePath).first<{ id: string }>();
+  if (existing) return error(request, cfg, 409, 'draft_exists');
+
+  const id = crypto.randomUUID();
+  const now = Date.now();
+  const [inserted] = await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO article_drafts
+       (id, article_path, base_sha, status, permalink, source_format, title, description,
+        published_at, categories_json, tags_json, cover_url, body, revision, created_at,
+        updated_at, created_by, updated_by)
+       VALUES (?, ?, ?, 'DRAFT', ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+       ON CONFLICT(permalink) DO NOTHING`
+    ).bind(
+      id, articlePath, baseSha, input.permalink, sourceFormat, input.title, input.description,
+      input.publishedAt, JSON.stringify(input.categories), JSON.stringify(input.tags),
+      input.coverUrl, input.body, now, now, userId, userId
+    ),
+    env.DB.prepare(
+      `INSERT INTO audit_logs
+       (id, github_user_id, action, created_at, result, resource_type, resource_id)
+       SELECT ?, ?, 'draft.create', ?, 'success', 'draft', ? WHERE changes() = 1`
+    ).bind(crypto.randomUUID(), userId, now, id)
+  ]);
+  if (inserted.meta.changes !== 1) return error(request, cfg, 409, 'draft_exists');
+  const row = await env.DB.prepare(
+    `SELECT ${DRAFT_COLUMNS} FROM article_drafts WHERE id = ?`
+  ).bind(id).first<DraftRow>();
+  if (!row) return error(request, cfg, 503, 'draft_save_failed');
+  return json(request, cfg, 201, { draft: storedDraft(row) });
+}
+
+async function updateManagedDraft(
+  request: Request,
+  env: Env,
+  cfg: Config,
+  userId: string,
+  id: string,
+  payload: unknown
+): Promise<Response> {
+  const input = parseManagedDraft(payload);
+  if (!input || !input.expectedRevision || input.articleId !== null) {
+    return error(request, cfg, 400, 'invalid_draft');
+  }
+  const existing = await env.DB.prepare(
+    `SELECT ${DRAFT_COLUMNS} FROM article_drafts WHERE id = ? AND status = 'DRAFT'`
+  ).bind(id).first<DraftRow>();
+  if (!existing) return error(request, cfg, 404, 'not_found');
+  if (input.permalink !== existing.permalink || input.sourceFormat !== existing.source_format) {
+    return error(request, cfg, 400, 'invalid_draft');
+  }
+  const now = Date.now();
+  const [updated] = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE article_drafts
+       SET title = ?, description = ?, published_at = ?, categories_json = ?, tags_json = ?,
+           cover_url = ?, body = ?, revision = revision + 1, updated_at = ?, updated_by = ?
+       WHERE id = ? AND revision = ? AND status = 'DRAFT'`
+    ).bind(
+      input.title, input.description, input.publishedAt, JSON.stringify(input.categories),
+      JSON.stringify(input.tags), input.coverUrl, input.body, now, userId, id, input.expectedRevision
+    ),
+    env.DB.prepare(
+      `INSERT INTO audit_logs
+       (id, github_user_id, action, created_at, result, resource_type, resource_id)
+       SELECT ?, ?, 'draft.update', ?, 'success', 'draft', ? WHERE changes() = 1`
+    ).bind(crypto.randomUUID(), userId, now, id)
+  ]);
+  if (updated.meta.changes !== 1) {
+    const current = await env.DB.prepare('SELECT id FROM article_drafts WHERE id = ?')
+      .bind(id).first<{ id: string }>();
+    return current
+      ? error(request, cfg, 409, 'revision_conflict')
+      : error(request, cfg, 404, 'not_found');
+  }
+  const row = await env.DB.prepare(
+    `SELECT ${DRAFT_COLUMNS} FROM article_drafts WHERE id = ?`
+  ).bind(id).first<DraftRow>();
+  if (!row) return error(request, cfg, 503, 'draft_save_failed');
+  return json(request, cfg, 200, { draft: storedDraft(row) });
+}
+
+async function deleteManagedDraft(
+  request: Request,
+  env: Env,
+  cfg: Config,
+  userId: string,
+  id: string
+): Promise<Response> {
+  const now = Date.now();
+  const [deleted] = await env.DB.batch([
+    env.DB.prepare('DELETE FROM article_drafts WHERE id = ? AND status = \'DRAFT\'').bind(id),
+    env.DB.prepare(
+      `INSERT INTO audit_logs
+       (id, github_user_id, action, created_at, result, resource_type, resource_id)
+       SELECT ?, ?, 'draft.delete', ?, 'success', 'draft', ? WHERE changes() = 1`
+    ).bind(crypto.randomUUID(), userId, now, id)
+  ]);
+  return deleted.meta.changes === 1
+    ? json(request, cfg, 200, { ok: true })
+    : error(request, cfg, 404, 'not_found');
+}
+
 async function providerJson(response: Response): Promise<unknown> {
   if (!response.body) throw new Error('Empty provider response');
   const reader = response.body.getReader();
@@ -308,12 +593,41 @@ function parseArticleDraft(value: unknown): ArticleDraft | null {
 }
 
 function validArticlePermalink(value: string | null): value is string {
-  return Boolean(value && value.length <= 200 &&
-    /^\d{4}\/\d{2}\/\d{2}\/[^/]+$/.test(value) &&
-    !value.split('/').some((part) => part === '.' || part === '..'));
+  if (!value || value.length > 200 ||
+      !/^\d{4}\/\d{2}\/\d{2}\/[A-Za-z0-9][A-Za-z0-9-]*$/.test(value)) return false;
+  const [year, month, day] = value.split('/').map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 &&
+    date.getUTCDate() === day;
+}
+
+function parseManagedDraft(value: unknown): ManagedDraftInput | null {
+  if (!isRecord(value)) return null;
+  const permalink = typeof value.permalink === 'string' ? value.permalink : null;
+  const articleId = value.articleId;
+  if (!validArticlePermalink(permalink) ||
+      !(articleId === null || typeof articleId === 'string' &&
+        /^a_[A-Za-z0-9_-]{22}$/.test(articleId))) return null;
+  const draft = parseArticleDraft(value);
+  if (!draft) return null;
+  const metadata = articleMetadataSchema.safeParse({
+    title: draft.title,
+    description: draft.description,
+    publishedAt: draft.publishedAt,
+    permalink,
+    categories: draft.categories,
+    tags: draft.tags,
+    ...(draft.coverUrl ? { cover: draft.coverUrl } : {})
+  });
+  if (!metadata.success) return null;
+  return { ...draft, permalink, articleId: typeof articleId === 'string' ? articleId : null };
 }
 
 function storedDraft(row: {
+  id: string;
+  article_path: string | null;
+  base_sha: string | null;
+  status: 'DRAFT';
   permalink: string;
   source_format: 'md' | 'mdx';
   title: string;
@@ -326,8 +640,14 @@ function storedDraft(row: {
   revision: number;
   created_at: number;
   updated_at: number;
+  created_by: string | null;
+  updated_by: string | null;
 }): StoredArticleDraft {
   return {
+    id: `d_${row.id}`,
+    articlePath: row.article_path,
+    baseSha: row.base_sha,
+    status: row.status,
     permalink: row.permalink,
     sourceFormat: row.source_format,
     title: row.title,
@@ -441,16 +761,17 @@ function validUnsafeRequest(request: Request, cfg: Config): boolean {
 async function handle(request: Request, env: Env, cfg: Config): Promise<Response> {
   const url = new URL(request.url);
   const path = url.pathname;
+  const routePath = path.length > 1 && path.endsWith('/') ? path.slice(0, -1) : path;
   if (request.method === 'OPTIONS') {
     const method = request.headers.get('Access-Control-Request-Method');
     const requestedHeaders = (request.headers.get('Access-Control-Request-Headers') || '')
       .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
-    if (request.headers.get('Origin') !== cfg.site || !['GET', 'POST', 'PUT'].includes(method || '') ||
+    if (request.headers.get('Origin') !== cfg.site || !['GET', 'POST', 'PUT', 'DELETE'].includes(method || '') ||
         requestedHeaders.some((h) => !['content-type', 'x-csrf-token'].includes(h))) {
       return error(request, cfg, 403, 'forbidden');
     }
     const h = headers(request, cfg);
-    h.set('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS');
+    h.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
     h.set('Access-Control-Allow-Headers', 'Content-Type, X-CSRF-Token');
     h.set('Vary', 'Origin, Access-Control-Request-Method, Access-Control-Request-Headers');
     return new Response(null, { status: 204, headers: h });
@@ -476,23 +797,74 @@ async function handle(request: Request, env: Env, cfg: Config): Promise<Response
         csrfToken: await csrf(auth.token, cfg.csrfSecret)
       });
     }
+    if (routePath === '/api/admin/articles' && request.method === 'GET') {
+      return adminArticleList(request, env, cfg);
+    }
+    const articleMatch = /^\/api\/admin\/articles\/([^/]+)$/.exec(routePath);
+    if (articleMatch && request.method === 'GET') {
+      let id: string;
+      try {
+        id = decodeURIComponent(articleMatch[1]);
+      } catch {
+        return error(request, cfg, 400, 'invalid_article_id');
+      }
+      return adminArticleDetail(request, env, cfg, id, auth.session.github_user_id);
+    }
+    if (routePath === '/api/admin/drafts' && request.method === 'POST') {
+      const csrfError = await requireCsrfProtection(request, auth, cfg);
+      if (csrfError) return csrfError;
+      if (!await limit(request, env.WRITE_RATE_LIMITER, 'draft-create')) {
+        return error(request, cfg, 429, 'rate_limited');
+      }
+      let payload: unknown;
+      try {
+        payload = await requestJson(request);
+      } catch (cause) {
+        return cause instanceof PayloadTooLargeError
+          ? error(request, cfg, 413, 'payload_too_large')
+          : error(request, cfg, 400, 'invalid_json');
+      }
+      return createManagedDraft(request, env, cfg, auth.session.github_user_id, payload);
+    }
+    const draftMatch = /^\/api\/admin\/drafts\/([^/]+)$/.exec(routePath);
+    if (draftMatch && (request.method === 'PUT' || request.method === 'DELETE')) {
+      let id: string;
+      try {
+        id = decodeURIComponent(draftMatch[1]);
+      } catch {
+        return error(request, cfg, 400, 'invalid_draft_id');
+      }
+      if (!/^d_[a-f0-9-]{32,36}$/i.test(id)) return error(request, cfg, 400, 'invalid_draft_id');
+      const csrfError = await requireCsrfProtection(request, auth, cfg);
+      if (csrfError) return csrfError;
+      if (!await limit(request, env.WRITE_RATE_LIMITER, `draft-${request.method.toLowerCase()}`)) {
+        return error(request, cfg, 429, 'rate_limited');
+      }
+      if (request.method === 'DELETE') {
+        return deleteManagedDraft(request, env, cfg, auth.session.github_user_id, id.slice(2));
+      }
+      let payload: unknown;
+      try {
+        payload = await requestJson(request);
+      } catch (cause) {
+        return cause instanceof PayloadTooLargeError
+          ? error(request, cfg, 413, 'payload_too_large')
+          : error(request, cfg, 400, 'invalid_json');
+      }
+      return updateManagedDraft(request, env, cfg, auth.session.github_user_id, id.slice(2), payload);
+    }
     if (path === '/api/admin/drafts' && request.method === 'GET') {
       const permalink = url.searchParams.getAll('permalink');
       if (permalink.length !== 1 || !validArticlePermalink(permalink[0])) {
         return error(request, cfg, 400, 'invalid_draft');
       }
       const row = await env.DB.prepare(
-        `SELECT permalink, source_format, title, description, published_at,
-                categories_json, tags_json, cover_url, body, revision, created_at, updated_at
-         FROM article_drafts WHERE permalink = ?`
-      ).bind(permalink[0]).first<{
-        permalink: string; source_format: 'md' | 'mdx'; title: string; description: string;
-        published_at: string; categories_json: string; tags_json: string; cover_url: string | null;
-        body: string; revision: number; created_at: number; updated_at: number;
-      }>();
-      return row
-        ? json(request, cfg, 200, { draft: storedDraft(row) })
-        : error(request, cfg, 404, 'not_found');
+        `SELECT ${DRAFT_COLUMNS}
+         FROM article_drafts WHERE permalink = ? AND status = 'DRAFT'`
+      ).bind(permalink[0]).first<DraftRow>();
+      if (!row) return error(request, cfg, 404, 'not_found');
+      await auditDraft(env, auth.session.github_user_id, 'draft.preview', row.id);
+      return json(request, cfg, 200, { draft: storedDraft(row) });
     }
     if (path === '/api/admin/drafts' && request.method === 'PUT') {
       const csrfError = await requireCsrfProtection(request, auth, cfg);
@@ -520,35 +892,46 @@ async function handle(request: Request, env: Env, cfg: Config): Promise<Response
         draft.sourceFormat, draft.title, draft.description, draft.publishedAt,
         JSON.stringify(draft.categories), JSON.stringify(draft.tags), draft.coverUrl, draft.body
       ];
-      const row = draft.expectedRevision === null
-        ? await env.DB.prepare(
-          `INSERT INTO article_drafts
-           (permalink, source_format, title, description, published_at, categories_json, tags_json,
-            cover_url, body, revision, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
-           ON CONFLICT(permalink) DO NOTHING
-           RETURNING permalink, source_format, title, description, published_at,
-                     categories_json, tags_json, cover_url, body, revision, created_at, updated_at`
-        ).bind(permalink, ...values, now, now).first<{
-          permalink: string; source_format: 'md' | 'mdx'; title: string; description: string;
-          published_at: string; categories_json: string; tags_json: string; cover_url: string | null;
-          body: string; revision: number; created_at: number; updated_at: number;
-        }>()
-        : await env.DB.prepare(
+      const creating = draft.expectedRevision === null;
+      const draftId = crypto.randomUUID();
+      const write = creating
+        ? env.DB.prepare(
+            `INSERT INTO article_drafts
+             (id, status, permalink, source_format, title, description, published_at,
+              categories_json, tags_json, cover_url, body, revision, created_at, updated_at,
+              created_by, updated_by)
+             VALUES (?, 'DRAFT', ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+             ON CONFLICT(permalink) DO NOTHING`
+          ).bind(draftId, permalink, ...values, now, now,
+            auth.session.github_user_id, auth.session.github_user_id)
+        : env.DB.prepare(
           `UPDATE article_drafts
            SET source_format = ?, title = ?, description = ?, published_at = ?, categories_json = ?,
-               tags_json = ?, cover_url = ?, body = ?, revision = revision + 1, updated_at = ?
-           WHERE permalink = ? AND revision = ?
-           RETURNING permalink, source_format, title, description, published_at,
-                     categories_json, tags_json, cover_url, body, revision, created_at, updated_at`
-        ).bind(...values, now, permalink, draft.expectedRevision).first<{
-          permalink: string; source_format: 'md' | 'mdx'; title: string; description: string;
-          published_at: string; categories_json: string; tags_json: string; cover_url: string | null;
-          body: string; revision: number; created_at: number; updated_at: number;
-        }>();
-      return row
-        ? json(request, cfg, 200, { draft: storedDraft(row) })
-        : error(request, cfg, 409, 'revision_conflict');
+                 tags_json = ?, cover_url = ?, body = ?, revision = revision + 1, updated_at = ?,
+                 updated_by = ?
+           WHERE permalink = ? AND revision = ? AND status = 'DRAFT'`
+          ).bind(...values, now, auth.session.github_user_id, permalink, draft.expectedRevision);
+      const [writeResult] = await env.DB.batch([
+        write,
+        env.DB.prepare(
+          `INSERT INTO audit_logs
+           (id, github_user_id, action, created_at, result, resource_type, resource_id)
+           SELECT ?, ?, ?, ?, 'success', 'draft', id
+           FROM article_drafts WHERE permalink = ? AND changes() = 1`
+        ).bind(
+          crypto.randomUUID(),
+          auth.session.github_user_id,
+          creating ? 'draft.create' : 'draft.update',
+          now,
+          permalink
+        )
+      ]);
+      if (writeResult.meta.changes !== 1) return error(request, cfg, 409, 'revision_conflict');
+      const row = await env.DB.prepare(
+        `SELECT ${DRAFT_COLUMNS} FROM article_drafts WHERE permalink = ?`
+      ).bind(permalink).first<DraftRow>();
+      if (!row) return error(request, cfg, 503, 'draft_save_failed');
+      return json(request, cfg, 200, { draft: storedDraft(row) });
     }
     if (path === '/api/logout' && request.method === 'POST') {
       const csrfError = await requireCsrfProtection(request, auth, cfg);

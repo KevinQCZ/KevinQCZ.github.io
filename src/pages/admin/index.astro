@@ -7,16 +7,29 @@ const apiOrigin = import.meta.env.PUBLIC_AUTH_API_ORIGIN ?? '';
   <section class="site-page">
     <div class="site-section">
       <h1>Administrator</h1>
-      <div id="admin-session" data-api-origin={apiOrigin}>
+      <div id="admin-session" class="admin-dashboard" data-api-origin={apiOrigin}>
         <p data-status role="status">Sign-in is unavailable without JavaScript.</p>
         <button class="button-primary" data-login type="button" hidden>Sign in with GitHub</button>
         <button class="button-secondary" data-logout type="button" hidden>Sign out</button>
+        <section class="admin-dashboard-tools" data-admin-tools hidden aria-label="Article drafts">
+          <div class="admin-dashboard-toolbar">
+            <p data-list-status class="admin-dashboard-status" role="status" aria-live="polite"></p>
+            <button class="button-primary" data-new-article type="button">Create new draft</button>
+          </div>
+          <h2>Published articles</h2>
+          <ul class="admin-dashboard-list" data-article-list></ul>
+          <h2>Private drafts</h2>
+          <ul class="admin-dashboard-list" data-draft-list></ul>
+          <div class="admin-dashboard-editor" data-editor-host hidden>
+            <div data-editor-mount></div>
+          </div>
+        </section>
       </div>
     </div>
   </section>
   <script>
-    import { initAdmin } from '../../../public/js/admin.js';
+    import { initAdminDashboard } from '../../scripts/admin-dashboard';
     const root = document.querySelector<HTMLElement>('#admin-session');
-    if (root) initAdmin(root);
+    if (root) void initAdminDashboard(root);
   </script>
 </SiteLayout>

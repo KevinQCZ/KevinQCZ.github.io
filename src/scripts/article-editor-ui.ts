@@ -1,14 +1,18 @@
 import type { EditorView } from 'codemirror';
 import { isSafeCoverUrl, renderSafeMarkdown } from './editor-preview';
-import type { AdminSession, ArticleDraft, ArticleSeed, DraftPayload } from './article-editor-types';
+import type { AdminSession, ArticleContent, ArticleDraft, EditorSeed, DraftPayload } from './article-editor-types';
 import '../styles/article-editor.css';
 
-type EditorContent = Omit<ArticleSeed, 'permalink'>;
+type EditorContent = ArticleContent;
 
 function isArticleDraft(value: unknown, permalink: string): value is ArticleDraft {
   if (!value || typeof value !== 'object') return false;
   const draft = value as Partial<ArticleDraft>;
-  return draft.permalink === permalink && ['md', 'mdx'].includes(String(draft.sourceFormat)) &&
+  return typeof draft.id === 'string' && /^d_[a-f0-9-]{32,36}$/i.test(draft.id) &&
+    (draft.articlePath === null || typeof draft.articlePath === 'string') &&
+    (draft.baseSha === null || typeof draft.baseSha === 'string') &&
+    draft.status === 'DRAFT' && draft.permalink === permalink &&
+    ['md', 'mdx'].includes(String(draft.sourceFormat)) &&
     typeof draft.title === 'string' && typeof draft.description === 'string' &&
     typeof draft.publishedAt === 'string' && Array.isArray(draft.categories) &&
     draft.categories.every((item) => typeof item === 'string') &&
@@ -18,8 +22,9 @@ function isArticleDraft(value: unknown, permalink: string): value is ArticleDraf
     typeof draft.createdAt === 'number' && typeof draft.updatedAt === 'number';
 }
 
-function contentOf(article: ArticleSeed | ArticleDraft): EditorContent {
+function contentOf(article: EditorSeed | ArticleDraft): EditorContent {
   return {
+    permalink: article.permalink,
     sourceFormat: article.sourceFormat,
     title: article.title,
     description: article.description,
@@ -32,7 +37,8 @@ function contentOf(article: ArticleSeed | ArticleDraft): EditorContent {
 }
 
 function sameContent(left: EditorContent, right: EditorContent): boolean {
-  return left.sourceFormat === right.sourceFormat &&
+  return left.permalink === right.permalink &&
+    left.sourceFormat === right.sourceFormat &&
     left.title === right.title &&
     left.description === right.description &&
     left.publishedAt === right.publishedAt &&
@@ -51,6 +57,7 @@ function editorMarkup(): string {
     <div class="article-editor-bar">
       <p data-editor-identity></p>
       <button type="button" class="button-secondary" data-editor-toggle aria-expanded="false">Edit article</button>
+      <button type="button" class="button-secondary" data-editor-close hidden>Back to drafts</button>
     </div>
     <section class="article-editor-panel" data-editor-panel hidden aria-label="Article editor">
       <div class="article-editor-toolbar">
@@ -81,7 +88,9 @@ function editorMarkup(): string {
           <label for="editor-cover">Cover image URL <span>HTTPS only</span></label>
           <input id="editor-cover" data-field="coverUrl" type="url" inputmode="url" maxlength="2048" />
           <p data-cover-error class="article-editor-error" aria-live="polite"></p>
-          <p class="article-editor-permalink">Published URL is fixed: <code data-permalink></code></p>
+          <label data-permalink-label for="editor-permalink">Permalink</label>
+          <input id="editor-permalink" data-permalink-input maxlength="200" pattern="[0-9]{4}/[0-9]{2}/[0-9]{2}/[A-Za-z0-9][A-Za-z0-9-]*" required />
+          <p class="article-editor-permalink" data-permalink-fixed hidden>Published URL is fixed: <code data-permalink></code></p>
         </fieldset>
         <section class="article-editor-source" id="editor-tabpanel" role="tabpanel" aria-labelledby="editor-tab" data-source-pane>
           <h2>Markdown / MDX source</h2>
@@ -103,15 +112,18 @@ function editorMarkup(): string {
 export async function mountArticleEditorUi(
   root: HTMLElement,
   apiOrigin: string,
-  seed: ArticleSeed,
+  seed: EditorSeed,
   session: AdminSession,
-  fetcher: typeof fetch = fetch
+  fetcher: typeof fetch = fetch,
+  initialDraft: ArticleDraft | null = null,
+  callbacks: { onSaved?: (draft: ArticleDraft) => void; onClose?: () => void } = {}
 ): Promise<void> {
   root.classList.add('article-editor');
   root.innerHTML = editorMarkup();
 
   const identity = root.querySelector<HTMLElement>('[data-editor-identity]')!;
   const toggle = root.querySelector<HTMLButtonElement>('[data-editor-toggle]')!;
+  const closeButton = root.querySelector<HTMLButtonElement>('[data-editor-close]')!;
   const panel = root.querySelector<HTMLElement>('[data-editor-panel]')!;
   const readMode = root.parentElement?.querySelector<HTMLElement>('[data-article-read-mode]');
   const status = root.querySelector<HTMLElement>('[data-editor-status]')!;
@@ -126,6 +138,9 @@ export async function mountArticleEditorUi(
   const previewPane = root.querySelector<HTMLElement>('[data-preview-pane]')!;
   const workspace = root.querySelector<HTMLElement>('[data-active-tab]')!;
   const coverError = root.querySelector<HTMLElement>('[data-cover-error]')!;
+  const permalinkInput = root.querySelector<HTMLInputElement>('[data-permalink-input]')!;
+  const permalinkLabel = root.querySelector<HTMLLabelElement>('[data-permalink-label]')!;
+  const permalinkFixed = root.querySelector<HTMLElement>('[data-permalink-fixed]')!;
   const readFields = (selector: string) => root.querySelector<HTMLInputElement | HTMLTextAreaElement>(`[data-field="${selector}"]`)!;
   const inputs = {
     title: readFields('title') as HTMLInputElement,
@@ -138,8 +153,11 @@ export async function mountArticleEditorUi(
   root.querySelector<HTMLElement>('[data-permalink]')!.textContent = `/${seed.permalink}/`;
   identity.textContent = `Signed in as ${session.user.githubLogin} (${session.user.role}).`;
 
-  let baseline = contentOf(seed);
-  let revision: number | null = null;
+  const newArticle = seed.articleId === null && initialDraft === null;
+  let baseline = contentOf(initialDraft ?? seed);
+  let revision: number | null = initialDraft?.revision ?? null;
+  let draftId: string | null = initialDraft?.id ?? null;
+  let permalinkEdited = false;
   let editor: EditorView | null = null;
   let editorLoad: Promise<void> | null = null;
   let editorError = false;
@@ -164,6 +182,7 @@ export async function mountArticleEditorUi(
 
   const bodyValue = () => editor?.state.doc.toString() ?? fallback.value;
   const currentContent = (): EditorContent => ({
+    permalink: permalinkInput.value.trim(),
     sourceFormat: seed.sourceFormat,
     title: inputs.title.value,
     description: inputs.description.value,
@@ -203,6 +222,8 @@ export async function mountArticleEditorUi(
   };
 
   const fill = (content: EditorContent) => {
+    permalinkInput.value = content.permalink;
+    root.querySelector<HTMLElement>('[data-permalink]')!.textContent = `/${content.permalink}/`;
     inputs.title.value = content.title;
     inputs.description.value = content.description;
     inputs.publishedAt.value = content.publishedAt;
@@ -213,6 +234,24 @@ export async function mountArticleEditorUi(
     else fallback.value = content.body;
     updatePreview();
   };
+
+  const slugFromTitle = (title: string) => title.normalize('NFKD').toLowerCase()
+    .replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'new-article';
+  const refreshGeneratedPermalink = () => {
+    if (!newArticle || draftId || permalinkEdited) return;
+    permalinkInput.value = `${inputs.publishedAt.value.replaceAll('-', '/')}/${slugFromTitle(inputs.title.value)}`;
+    root.querySelector<HTMLElement>('[data-permalink]')!.textContent = `/${permalinkInput.value}/`;
+  };
+  if (newArticle) {
+    permalinkInput.hidden = false;
+    permalinkLabel.hidden = false;
+    permalinkFixed.hidden = true;
+  } else {
+    permalinkInput.hidden = true;
+    permalinkLabel.hidden = true;
+    permalinkFixed.hidden = false;
+  }
+  if (callbacks.onClose) closeButton.hidden = false;
 
   const beforeUnload = (event: BeforeUnloadEvent) => {
     if (!dirty) return;
@@ -279,31 +318,25 @@ export async function mountArticleEditorUi(
     }
   };
 
-  let loadError: string | null = null;
-  try {
-    const query = new URLSearchParams({ permalink: seed.permalink });
-    const response = await fetcher(`${apiOrigin}/api/admin/drafts?${query}`, { credentials: 'include' });
-    if (response.status === 200) {
-      const result: unknown = await response.json();
-      if (!result || typeof result !== 'object' ||
-          !('draft' in result) || !isArticleDraft(result.draft, seed.permalink)) {
-        throw new Error('Invalid draft response');
-      }
-      baseline = contentOf(result.draft);
-      revision = result.draft.revision;
-    } else if (response.status !== 404) {
-      throw new Error('Could not load saved draft');
-    }
-  } catch {
-    loadError = 'Could not load the saved draft; your edits will be kept if the request fails.';
-  }
   fill(baseline);
   refreshDirty();
-  if (loadError) setStatus(loadError, true);
 
   root.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>('[data-field]').forEach((input) => {
-    input.addEventListener('input', refreshDirty);
-    input.addEventListener('change', refreshDirty);
+    input.addEventListener('input', () => {
+      if (newArticle && !draftId && !permalinkEdited &&
+          (input === inputs.title || input === inputs.publishedAt)) refreshGeneratedPermalink();
+      refreshDirty();
+    });
+    input.addEventListener('change', () => {
+      if (newArticle && !draftId && !permalinkEdited &&
+          (input === inputs.title || input === inputs.publishedAt)) refreshGeneratedPermalink();
+      refreshDirty();
+    });
+  });
+  permalinkInput.addEventListener('input', () => {
+    permalinkEdited = true;
+    root.querySelector<HTMLElement>('[data-permalink]')!.textContent = `/${permalinkInput.value}/`;
+    refreshDirty();
   });
   fallback.addEventListener('input', refreshDirty);
   window.addEventListener('beforeunload', beforeUnload);
@@ -321,6 +354,12 @@ export async function mountArticleEditorUi(
     refreshDirty();
     void setEditing(false);
     setStatus('Changes cancelled.');
+  });
+  closeButton.addEventListener('click', () => {
+    if (dirty && !window.confirm('Discard unsaved article changes and return to drafts?')) return;
+    fill(baseline);
+    refreshDirty();
+    callbacks.onClose?.();
   });
 
   root.querySelectorAll<HTMLButtonElement>('[data-tab]').forEach((button) => {
@@ -346,6 +385,7 @@ export async function mountArticleEditorUi(
 
   saveButton.addEventListener('click', async () => {
     if (!dirty || saving) return;
+    if (newArticle && !draftId && !permalinkInput.reportValidity()) return;
     if (!inputs.title.reportValidity() || !inputs.description.reportValidity() ||
         !inputs.publishedAt.reportValidity()) return;
     const current = currentContent();
@@ -355,18 +395,31 @@ export async function mountArticleEditorUi(
       setStatus('Fix the cover image URL before saving.', true);
       return;
     }
-    const query = new URLSearchParams({ permalink: seed.permalink });
-    const payload: DraftPayload = { ...current, permalink: seed.permalink, expectedRevision: revision };
+    if (!/^\d{4}\/\d{2}\/\d{2}\/[A-Za-z0-9][A-Za-z0-9-]*$/.test(current.permalink)) {
+      setStatus('Use a date-based permalink with a simple slug.', true);
+      permalinkInput.focus();
+      return;
+    }
+    const payload: DraftPayload = {
+      ...current,
+      articleId: draftId ? null : seed.articleId,
+      expectedRevision: revision
+    };
     saving = true;
     saveButton.disabled = true;
     setStatus('Saving draft…');
     try {
-      const response = await fetcher(`${apiOrigin}/api/admin/drafts?${query}`, {
-        method: 'PUT',
+      const response = await fetcher(
+        draftId
+          ? `${apiOrigin}/api/admin/drafts/${encodeURIComponent(draftId)}`
+          : `${apiOrigin}/api/admin/drafts`,
+        {
+        method: draftId ? 'PUT' : 'POST',
         credentials: 'include',
         headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': session.csrfToken },
         body: JSON.stringify(payload)
-      });
+        }
+      );
       if (response.status === 409) {
         setStatus('A newer draft exists. Your edits are still here; copy them before reloading the saved draft.', true);
         return;
@@ -374,14 +427,21 @@ export async function mountArticleEditorUi(
       if (!response.ok) throw new Error('Draft save failed');
       const result: unknown = await response.json();
       if (!result || typeof result !== 'object' ||
-          !('draft' in result) || !isArticleDraft(result.draft, seed.permalink)) {
+          !('draft' in result) || !isArticleDraft(result.draft, current.permalink)) {
         throw new Error('Invalid saved draft response');
       }
       baseline = contentOf(result.draft);
       revision = result.draft.revision;
+      draftId = result.draft.id;
+      permalinkInput.disabled = true;
+      permalinkInput.hidden = true;
+      permalinkLabel.hidden = true;
+      permalinkFixed.hidden = false;
+      root.querySelector<HTMLElement>('[data-permalink]')!.textContent = `/${result.draft.permalink}/`;
       dirty = false;
       saveButton.disabled = true;
-      setStatus('Draft saved locally. It has not been published.');
+      setStatus(`Draft saved locally at ${new Date(result.draft.updatedAt).toLocaleString()}. It has not been published.`);
+      callbacks.onSaved?.(result.draft);
     } catch {
       setStatus('Draft could not be saved. Your edits are still here.', true);
     } finally {
@@ -390,5 +450,11 @@ export async function mountArticleEditorUi(
     }
   });
 
+  if (initialDraft) {
+    permalinkInput.disabled = true;
+    permalinkInput.hidden = true;
+    permalinkLabel.hidden = true;
+    permalinkFixed.hidden = false;
+  }
   setTab('editor');
 }

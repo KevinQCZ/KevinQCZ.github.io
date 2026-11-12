@@ -1,4 +1,5 @@
 ---
+import { createHash } from 'node:crypto';
 import { getCollection, render } from 'astro:content';
 import type { CollectionEntry } from 'astro:content';
 import PageIntro from '../components/PageIntro.astro';
@@ -33,16 +34,22 @@ export async function getStaticPaths() {
 const { article, newerArticle, olderArticle } = Astro.props as Props;
 const { Content, headings } = await render(article as CollectionEntry<'articles'>);
 const { title, description, publishedAt, categories, tags, cover } = article.data;
-const editorSeed = {
+const sourcePath = article.filePath?.replaceAll('\\', '/');
+const pathMarker = 'src/content/articles/';
+const pathStart = sourcePath?.lastIndexOf(pathMarker) ?? -1;
+const sourceFormat = article.filePath?.endsWith('.md') ? 'md' : 'mdx';
+const articlePath = pathStart >= 0
+  ? sourcePath!.slice(pathStart)
+  : `src/content/articles/${article.id.endsWith('.md') || article.id.endsWith('.mdx')
+    ? article.id
+    : `${article.id}.${sourceFormat}`}`;
+if (!/^src\/content\/articles\/(?:[A-Za-z0-9_-]+\/)*[A-Za-z0-9_-]+\.(?:md|mdx)$/.test(articlePath)) {
+  throw new Error('Article source path is not supported by the administrator editor.');
+}
+const articleId = `a_${createHash('sha256').update(articlePath).digest('base64url').slice(0, 22)}`;
+const editorLocator = {
+  articleId,
   permalink: article.data.permalink,
-  sourceFormat: article.filePath?.endsWith('.md') ? 'md' : 'mdx',
-  title,
-  description,
-  publishedAt: publishedAt.toISOString().slice(0, 10),
-  categories,
-  tags,
-  coverUrl: cover ?? null,
-  body: article.body ?? ''
 };
 const apiOrigin = import.meta.env.PUBLIC_AUTH_API_ORIGIN ?? '';
 ---
@@ -60,7 +67,7 @@ const apiOrigin = import.meta.env.PUBLIC_AUTH_API_ORIGIN ?? '';
       <div
         data-article-editor
         data-api-origin={apiOrigin}
-        data-article-seed={JSON.stringify(editorSeed)}
+        data-article-locator={JSON.stringify(editorLocator)}
       ></div>
       <div data-article-read-mode>
         <PageIntro eyebrow="Writing" title={title} description={description} />

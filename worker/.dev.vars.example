@@ -4,3 +4,9 @@ GITHUB_CLIENT_ID=replace-with-local-client-id
 GITHUB_CLIENT_SECRET=replace-with-local-client-secret
 ADMIN_GITHUB_IDS=replace-with-numeric-ids
 CSRF_SECRET=replace-with-at-least-32-random-characters
+
+# Optional; required for published-source retrieval and new-draft collision checks.
+# Configure a GitHub App installed on KevinQCZ/KevinQCZ.github.io with Contents: read only.
+# GITHUB_APP_ID=replace-with-app-id
+# GITHUB_APP_INSTALLATION_ID=replace-with-installation-id
+# GITHUB_APP_PRIVATE_KEY=replace-with-private-key-pem

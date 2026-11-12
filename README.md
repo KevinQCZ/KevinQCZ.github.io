@@ -51,7 +51,8 @@ same-site sibling hosts; plain localhost testing does not verify them.
 prevent sign-in. Cloudflare's IP-based rate limits are approximate per location,
 not global, and shared IPs may be affected. A trusted Cloudflare-provided
 `CF-Connecting-IP` is required. The in-page editor and draft API are described
-below; there is no publishing or GitHub content-write integration.
+below; the local Worker can retrieve published source through a server-side,
+read-only GitHub App integration. It never writes to GitHub or publishes content.
 
 ## In-page article editor and local drafts
 
@@ -59,16 +60,30 @@ Article pages stay statically generated and publicly readable. Editing controls
 load only after the configured HTTPS API confirms an `ADMIN` session through
 `GET /api/me`; the browser never decides its own role. Administrators can edit
 article metadata and the original Markdown/MDX source, preview it safely, and save
-an unpublished draft. Saving uses the authenticated, CSRF-protected
-`/api/admin/drafts` endpoints and the `article_drafts` D1 table from migration
-`0003_article_drafts.sql`. Drafts are not added to public pages, the Astro content
-collection, or GitHub.
+an unpublished draft. The authenticated Worker uses `GET /api/admin/articles`
+and `GET /api/admin/articles/:id` to list articles and retrieve their exact
+source and Git blob SHA, then `POST /api/admin/drafts`,
+`PUT /api/admin/drafts/:id`, and `DELETE /api/admin/drafts/:id` for private draft
+management. These endpoints use the existing server-side ADMIN session and CSRF
+protections. D1 migrations `0003_article_drafts.sql` and
+`0004_draft_management.sql` preserve local drafts, track revisions, and record
+draft lifecycle audit events without article content. Drafts are not added to
+public pages, the Astro content collection, or GitHub.
 
 The editor does not execute MDX or custom components in its preview. Raw HTML and
 JSX are shown as escaped source; Markdown image references are placeholders, and
 only an explicitly entered HTTPS cover URL may load in the preview. The editor
-and draft API have not been deployed remotely. Local Worker tests cover draft
-authorization, CSRF, validation, size limits, persistence, and revision conflicts.
+and draft API have not been deployed remotely. To enable local published-source
+retrieval and safe new-draft collision checks, configure the optional GitHub App values listed in
+`worker/.dev.vars.example`; the App must be installed only on this repository
+with Contents read permission. Keep the private key in the ignored
+`worker/.dev.vars` file and never commit or log it. If the values are missing or
+GitHub is temporarily unavailable, the admin list still returns existing private
+drafts with `publishedSourceAvailable: false`; published-source reads and draft
+creation fail closed with `503`, while existing drafts can still be continued or
+deleted. Tests use generated keys and mocked GitHub responses, not a real App.
+Local Worker tests cover draft authorization, CSRF, validation, size limits,
+persistence, audit records, and revision conflicts.
 The existing HTTPS-only origin and Secure-cookie requirements still apply, so
 plain HTTP localhost does not provide a real browser-authenticated editing setup.
 
@@ -90,11 +105,14 @@ as-is. A real setup requires separate approval and owner-supplied values:
    only after explicit approval.
 4. Configure the `DB`, `AUTH_RATE_LIMITER`, and `WRITE_RATE_LIMITER` bindings,
    an explicit Worker route/custom domain, and `SITE_ORIGIN`, `API_ORIGIN`,
-   `GITHUB_CLIENT_ID`, and `ADMIN_GITHUB_IDS`. Set the site's
+   `GITHUB_CLIENT_ID`, `ADMIN_GITHUB_IDS`, `GITHUB_APP_ID`, and
+   `GITHUB_APP_INSTALLATION_ID`. Set the site's
    `PUBLIC_AUTH_API_ORIGIN` to the same API origin when building the static
    admin page.
-5. Add `GITHUB_CLIENT_SECRET` and a randomly generated `CSRF_SECRET` (at least
-   32 bytes) as Worker secrets. Never commit or log their values. Use a
+5. Add `GITHUB_CLIENT_SECRET`, `GITHUB_APP_PRIVATE_KEY`, and a randomly
+   generated `CSRF_SECRET` (at least 32 bytes) as Worker secrets. The GitHub App
+   needs Contents read permission for this phase; do not grant write access.
+   Never commit or log secret values. Use a
    verified numeric GitHub ID; the synthetic test identity is not an
    administrator configuration.
 6. Only after separately approved provisioning and review, configure the
