@@ -50,7 +50,27 @@ same-site sibling hosts; plain localhost testing does not verify them.
 `github.io` and `workers.dev` are cross-site and third-party cookie blocking can
 prevent sign-in. Cloudflare's IP-based rate limits are approximate per location,
 not global, and shared IPs may be affected. A trusted Cloudflare-provided
-`CF-Connecting-IP` is required. No editor or publishing feature is included.
+`CF-Connecting-IP` is required. The in-page editor and draft API are described
+below; there is no publishing or GitHub content-write integration.
+
+## In-page article editor and local drafts
+
+Article pages stay statically generated and publicly readable. Editing controls
+load only after the configured HTTPS API confirms an `ADMIN` session through
+`GET /api/me`; the browser never decides its own role. Administrators can edit
+article metadata and the original Markdown/MDX source, preview it safely, and save
+an unpublished draft. Saving uses the authenticated, CSRF-protected
+`/api/admin/drafts` endpoints and the `article_drafts` D1 table from migration
+`0003_article_drafts.sql`. Drafts are not added to public pages, the Astro content
+collection, or GitHub.
+
+The editor does not execute MDX or custom components in its preview. Raw HTML and
+JSX are shown as escaped source; Markdown image references are placeholders, and
+only an explicitly entered HTTPS cover URL may load in the preview. The editor
+and draft API have not been deployed remotely. Local Worker tests cover draft
+authorization, CSRF, validation, size limits, persistence, and revision conflicts.
+The existing HTTPS-only origin and Secure-cookie requirements still apply, so
+plain HTTP localhost does not provide a real browser-authenticated editing setup.
 
 ### Future Cloudflare deployment checklist (not configured or verified)
 

@@ -39,7 +39,8 @@ beforeEach(async () => {
   await env.DB.batch([
     env.DB.prepare('DELETE FROM admin_sessions'),
     env.DB.prepare('DELETE FROM oauth_transactions'),
-    env.DB.prepare('DELETE FROM audit_logs')
+    env.DB.prepare('DELETE FROM audit_logs'),
+    env.DB.prepare('DELETE FROM article_drafts')
   ]);
   limiter.limit.mockReset().mockResolvedValue({ success: true });
   vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
@@ -275,5 +276,92 @@ describe('authorization, CSRF, CORS and failure behavior', () => {
     expect(denied.status).toBe(429);
     expect(denied.headers.has('Set-Cookie')).toBe(false);
     expect((await invoke('/api/me', { headers: { Cookie: session } })).status).toBe(200);
+  });
+
+  it('stores private drafts only for admins and enforces CSRF, validation and revisions', async () => {
+    expect((await invoke('/api/admin/drafts?permalink=2026/01/01/example')).status).toBe(401);
+    const { session } = await login();
+    const me = await invoke('/api/me', { headers: { Cookie: session, Origin: config.SITE_ORIGIN } });
+    const { csrfToken } = await me.json() as { csrfToken: string };
+    const headers = {
+      Cookie: session,
+      Origin: config.SITE_ORIGIN,
+      'Content-Type': 'application/json',
+      'X-CSRF-Token': csrfToken
+    };
+    const path = '/api/admin/drafts?permalink=2026/01/01/example';
+    const payload = {
+      permalink: '2026/01/01/example',
+      sourceFormat: 'mdx',
+      title: 'Private draft',
+      description: 'Not published',
+      publishedAt: '2026-01-01',
+      categories: ['Engineering'],
+      tags: ['Astro'],
+      coverUrl: null,
+      body: '# Draft source',
+      expectedRevision: null
+    };
+
+    expect((await invoke(path, { headers: { Cookie: session } })).status).toBe(404);
+    expect((await invoke(path, {
+      method: 'PUT', headers: { ...headers, 'X-CSRF-Token': 'invalid' }, body: JSON.stringify(payload)
+    })).status).toBe(403);
+    expect((await invoke('/api/admin/drafts?permalink=../../private', {
+      method: 'PUT', headers, body: JSON.stringify(payload)
+    })).status).toBe(400);
+
+    const created = await invoke(path, { method: 'PUT', headers, body: JSON.stringify(payload) });
+    expect(created.status).toBe(200);
+    const first = await created.json() as { draft: { revision: number; body: string } };
+    expect(first.draft).toMatchObject({ revision: 1, body: '# Draft source' });
+    expect((await invoke(path, { headers: { Cookie: session } })).status).toBe(200);
+    const stale = await invoke(path, {
+      method: 'PUT', headers, body: JSON.stringify(payload)
+    });
+    expect(stale.status).toBe(409);
+
+    const updated = await invoke(path, {
+      method: 'PUT', headers, body: JSON.stringify({ ...payload, expectedRevision: 1, title: 'Updated draft' })
+    });
+    expect(updated.status).toBe(200);
+    expect((await updated.json() as { draft: { revision: number; title: string } }).draft)
+      .toMatchObject({ revision: 2, title: 'Updated draft' });
+    const stored = await env.DB.prepare('SELECT title, body FROM article_drafts WHERE permalink = ?')
+      .bind(payload.permalink).first<{ title: string; body: string }>();
+    expect(stored).toEqual({ title: 'Updated draft', body: '# Draft source' });
+  });
+
+  it('rejects unsafe draft fields, invalid origins and oversized requests', async () => {
+    const { session } = await login();
+    const me = await invoke('/api/me', { headers: { Cookie: session, Origin: config.SITE_ORIGIN } });
+    const { csrfToken } = await me.json() as { csrfToken: string };
+    const headers = {
+      Cookie: session,
+      Origin: config.SITE_ORIGIN,
+      'Content-Type': 'application/json',
+      'X-CSRF-Token': csrfToken
+    };
+    const path = '/api/admin/drafts?permalink=2026/01/01/example';
+    const payload = {
+      permalink: '2026/01/01/example',
+      sourceFormat: 'md',
+      title: 'Draft',
+      description: 'Draft description',
+      publishedAt: '2026-01-01',
+      categories: [],
+      tags: [],
+      coverUrl: 'javascript:alert(1)',
+      body: '# Draft',
+      expectedRevision: null
+    };
+    expect((await invoke(path, { method: 'PUT', headers, body: JSON.stringify(payload) })).status).toBe(400);
+    expect((await invoke(path, {
+      method: 'PUT', headers: { ...headers, Origin: 'https://evil.example' }, body: JSON.stringify({ ...payload, coverUrl: null })
+    })).status).toBe(403);
+    expect((await invoke(path, {
+      method: 'PUT', headers, body: ' '.repeat(400 * 1024 + 1)
+    })).status).toBe(413);
+    expect((await env.DB.prepare('SELECT COUNT(*) AS count FROM article_drafts').first<{ count: number }>())?.count).toBe(0);
   });
 });

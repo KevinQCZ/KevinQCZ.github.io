@@ -11,18 +11,25 @@
     "preview": "astro preview",
     "check": "astro check && npm run check:worker",
     "check:worker": "tsc -p worker/tsconfig.json --noEmit",
-    "test": "node --test scripts/*.test.mjs && node --check public/js/writing-search.js && npm run test:worker",
+    "test": "node --test scripts/*.test.mjs && node --check public/js/writing-search.js && npm run test:ui && npm run test:worker",
+    "test:ui": "vitest run --config vitest.config.ts",
     "test:worker": "vitest run --config worker/vitest.config.ts",
     "validate": "node scripts/validate-site.mjs"
   },
   "dependencies": {
     "@astrojs/mdx": "^8.1.4",
-    "astro": "^7.4.10"
+    "@codemirror/lang-markdown": "6.5.2",
+    "@codemirror/state": "^6.7.6",
+    "astro": "^7.4.10",
+    "codemirror": "6.0.2",
+    "dompurify": "3.4.17",
+    "marked": "18.2.0"
   },
   "devDependencies": {
     "@astrojs/check": "^0.9.12",
     "@cloudflare/vitest-plugin": "1.8.0",
     "@cloudflare/workers-types": "5.20261112.1",
+    "happy-dom": "21.0.4",
     "typescript": "^6.0.3",
     "vitest": "5.1.0",
     "wrangler": "4.160.1"
