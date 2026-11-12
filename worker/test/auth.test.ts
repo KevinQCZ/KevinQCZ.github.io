@@ -17,10 +17,17 @@ const getCookie = (response: Response, name: string) => {
   const headers = response.headers.getSetCookie();
   return headers.find((value) => value.startsWith(`${name}=`))?.split(';')[0] ?? '';
 };
-const invoke = (path: string, init: RequestInit = {}, overrides = {}) =>
-  worker.fetch(new Request(`https://api.example.test${path}`, {
-    ...init, headers: { ...ip, ...init.headers }
+const invoke = (path: string, init: RequestInit = {}, overrides = {}) => {
+  const headers = new Headers({ ...ip, ...init.headers });
+  const rawToken = headers.get('Cookie') || '';
+  if (/^[A-Za-z0-9_-]{43}$/.test(rawToken)) {
+    headers.delete('Cookie');
+    headers.set('Authorization', `Bearer ${rawToken}`);
+  }
+  return worker.fetch(new Request(`https://api.example.test${path}`, {
+    ...init, headers
   }), { ...bindings(), ...overrides });
+};
 
 async function login() {
   const start = await invoke('/auth/github');
@@ -29,7 +36,21 @@ async function login() {
   const callback = await invoke(`/auth/github/callback?state=${location.searchParams.get('state')}&code=dummy-code`, {
     headers: { Cookie: tx }
   });
-  return { start, location, tx, callback, session: getCookie(callback, '__Host-admin_session') };
+  const redirectUrl = new URL(callback.headers.get('Location') || config.SITE_ORIGIN);
+  const handoff = new URLSearchParams(redirectUrl.hash.slice(1)).get('copilot_auth');
+  if (!handoff) return { start, location, tx, callback, exchange: null, session: '', csrfToken: '' };
+  const exchange = await invoke('/api/auth/exchange', {
+    method: 'POST',
+    headers: { Origin: config.SITE_ORIGIN, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code: handoff })
+  });
+  const sessionBody = exchange.ok
+    ? await exchange.json() as { token: string; csrfToken: string }
+    : { token: '', csrfToken: '' };
+  return {
+    start, location, tx, callback, exchange,
+    session: sessionBody.token, csrfToken: sessionBody.csrfToken
+  };
 }
 
 beforeAll(async () => {
@@ -39,6 +60,7 @@ beforeEach(async () => {
   await env.DB.batch([
     env.DB.prepare('DELETE FROM admin_sessions'),
     env.DB.prepare('DELETE FROM oauth_transactions'),
+    env.DB.prepare('DELETE FROM oauth_handoffs'),
     env.DB.prepare('DELETE FROM audit_logs'),
     env.DB.prepare('DELETE FROM article_drafts')
   ]);
@@ -63,9 +85,13 @@ describe('OAuth and sessions', () => {
     expect(result.location.searchParams.get('code_challenge_method')).toBe('S256');
     expect(result.start.headers.get('Set-Cookie')).toMatch(/Secure; HttpOnly; SameSite=Lax/);
     expect(result.callback.status).toBe(302);
-    expect(result.callback.headers.get('Location')).toBe(`${config.SITE_ORIGIN}/admin/`);
-    expect(result.callback.headers.get('Set-Cookie')).toMatch(/Secure; HttpOnly; SameSite=Lax/);
+    const callbackLocation = new URL(result.callback.headers.get('Location')!);
+    expect(callbackLocation.origin).toBe(config.SITE_ORIGIN);
+    expect(callbackLocation.pathname).toBe('/admin/');
+    expect(callbackLocation.hash).toMatch(/^#copilot_auth=[A-Za-z0-9_-]{43}$/);
+    expect(result.callback.headers.get('Set-Cookie')).toContain('Max-Age=0');
     expect(result.session).toBeTruthy();
+    expect(result.exchange?.status).toBe(200);
     const tokenBody = JSON.parse(String(vi.mocked(fetch).mock.calls[0][1]?.body));
     const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(tokenBody.code_verifier)));
     const challenge = btoa(String.fromCharCode(...digest)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -73,8 +99,8 @@ describe('OAuth and sessions', () => {
     const stored = await env.DB.prepare('SELECT * FROM admin_sessions').first<Record<string, unknown>>();
     expect(stored?.github_user_id).toBe('123');
     expect(stored?.github_login).toBe('approved-user');
-    expect(stored?.session_hash).not.toBe(result.session.split('=')[1]);
-    expect(Number(stored?.expires_at) - Number(stored?.created_at)).toBe(86400000);
+    expect(stored?.session_hash).not.toBe(result.session);
+    expect(Number(stored?.expires_at) - Number(stored?.created_at)).toBe(3600000);
     expect(stored?.last_used_at).toBe(stored?.created_at);
     const replay = await invoke(`/auth/github/callback?state=${result.location.searchParams.get('state')}&code=again`, {
       headers: { Cookie: result.tx }
@@ -99,6 +125,60 @@ describe('OAuth and sessions', () => {
     })).status).toBe(400);
   });
 
+  it('uses a same-site return path and consumes the short-lived handoff once', async () => {
+    expect((await invoke('/auth/github?return_to=%2F%2Fevil.example')).status).toBe(400);
+    expect((await invoke('/auth/github?return_to=https%3A%2F%2Fevil.example')).status).toBe(400);
+
+    const start = await invoke('/auth/github?return_to=%2F2026%2F01%2F01%2Fexample%2F');
+    const authorize = new URL(start.headers.get('Location')!);
+    const callback = await invoke(
+      `/auth/github/callback?state=${authorize.searchParams.get('state')}&code=dummy-code`,
+      { headers: { Cookie: getCookie(start, '__Host-oauth_transaction') } }
+    );
+    const destination = new URL(callback.headers.get('Location')!);
+    expect(destination.pathname).toBe('/2026/01/01/example/');
+    const code = new URLSearchParams(destination.hash.slice(1)).get('copilot_auth')!;
+    const body = JSON.stringify({ code });
+    const invalidOrigin = await invoke('/api/auth/exchange', {
+      method: 'POST',
+      headers: { Origin: 'https://evil.example', 'Content-Type': 'application/json' },
+      body
+    });
+    expect(invalidOrigin.status).toBe(403);
+    const exchange = await invoke('/api/auth/exchange', {
+      method: 'POST',
+      headers: {
+        Origin: config.SITE_ORIGIN,
+        'Sec-Fetch-Site': 'cross-site',
+        'Content-Type': 'application/json'
+      },
+      body
+    });
+    expect(exchange.status).toBe(200);
+    const result = await exchange.json() as { token: string };
+    expect(result.token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect((await invoke('/api/auth/exchange', {
+      method: 'POST',
+      headers: { Origin: config.SITE_ORIGIN, 'Content-Type': 'application/json' },
+      body
+    })).status).toBe(400);
+
+    const nextStart = await invoke('/auth/github');
+    const nextAuthorize = new URL(nextStart.headers.get('Location')!);
+    const nextCallback = await invoke(
+      `/auth/github/callback?state=${nextAuthorize.searchParams.get('state')}&code=dummy-code`,
+      { headers: { Cookie: getCookie(nextStart, '__Host-oauth_transaction') } }
+    );
+    const expiredCode = new URLSearchParams(new URL(nextCallback.headers.get('Location')!).hash.slice(1))
+      .get('copilot_auth')!;
+    await env.DB.prepare('UPDATE oauth_handoffs SET expires_at = 0').run();
+    expect((await invoke('/api/auth/exchange', {
+      method: 'POST',
+      headers: { Origin: config.SITE_ORIGIN, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code: expiredCode })
+    })).status).toBe(400);
+  });
+
   it('denies unauthorized and unsafe provider identities without a session', async () => {
     vi.mocked(fetch).mockImplementation(async (url) =>
       url === 'https://github.com/login/oauth/access_token'
@@ -106,7 +186,8 @@ describe('OAuth and sessions', () => {
         : Response.json({ id: 999, login: 'not-allowed' })
     );
     const rejected = await login();
-    expect(rejected.callback.status).toBe(403);
+    expect(rejected.callback.status).toBe(302);
+    expect(new URL(rejected.callback.headers.get('Location')!).hash).toContain('copilot_auth_error=forbidden');
     expect(rejected.session).toBe('');
     vi.mocked(fetch).mockImplementation(async (url) =>
       url === 'https://github.com/login/oauth/access_token'
@@ -150,16 +231,12 @@ describe('OAuth and sessions', () => {
     expect(vi.mocked(fetch)).not.toHaveBeenCalled();
   });
 
-  it('rotates an existing session on login', async () => {
+  it('issues a fresh high-entropy token for each one-time handoff', async () => {
     const first = await login();
-    const start = await invoke('/auth/github');
-    const url = new URL(start.headers.get('Location')!);
-    const next = await invoke(`/auth/github/callback?state=${url.searchParams.get('state')}&code=abc`, {
-      headers: { Cookie: `${getCookie(start, '__Host-oauth_transaction')}; ${first.session}` }
-    });
-    expect(next.status).toBe(302);
-    expect((await invoke('/api/me', { headers: { Cookie: first.session } })).status).toBe(401);
-    expect((await invoke('/api/me', { headers: { Cookie: getCookie(next, '__Host-admin_session') } })).status).toBe(200);
+    const second = await login();
+    expect(second.session).not.toBe(first.session);
+    expect((await invoke('/api/me', { headers: { Cookie: first.session } })).status).toBe(200);
+    expect((await invoke('/api/me', { headers: { Cookie: second.session } })).status).toBe(200);
   });
 
   it('returns only server-verified identity and role and updates last use without sliding expiry', async () => {
@@ -178,7 +255,7 @@ describe('OAuth and sessions', () => {
     });
     expect(body.csrfToken).toBeTruthy();
     expect(JSON.stringify(body)).not.toContain('dummy-oauth-token');
-    expect(JSON.stringify(body)).not.toContain(session.split('=')[1]);
+    expect(JSON.stringify(body)).not.toContain(session);
     const after = await env.DB.prepare('SELECT expires_at, last_used_at FROM admin_sessions').first<{
       expires_at: number;
       last_used_at: number;
@@ -218,6 +295,9 @@ describe('authorization, CSRF, CORS and failure behavior', () => {
     expect((await invoke('/api/admin/', { headers: { Cookie: session } })).status).toBe(404);
     expect((await invoke('/api/me', { headers: { Cookie: session } }, { ADMIN_GITHUB_IDS: '999' })).status).toBe(403);
     expect((await invoke('/api/admin/articles', { headers: { Cookie: session } }, { ADMIN_GITHUB_IDS: '999' })).status).toBe(403);
+    expect((await invoke('/api/me', {
+      headers: { Cookie: `__Host-admin_session=${session}` }
+    })).status).toBe(401);
     await env.DB.prepare('UPDATE admin_sessions SET expires_at = 0').run();
     expect((await invoke('/api/me', { headers: { Cookie: session } })).status).toBe(401);
   });
@@ -227,25 +307,25 @@ describe('authorization, CSRF, CORS and failure behavior', () => {
     const me = await invoke('/api/me', { headers: { Cookie: session, Origin: config.SITE_ORIGIN } });
     const data = await me.json() as { csrfToken: string };
     expect(me.headers.get('Access-Control-Allow-Origin')).toBe(config.SITE_ORIGIN);
-    expect(me.headers.get('Access-Control-Allow-Credentials')).toBe('true');
+    expect(me.headers.get('Access-Control-Allow-Credentials')).toBeNull();
     expect(me.headers.get('Cache-Control')).toBe('no-store');
     const good = { Cookie: session, Origin: config.SITE_ORIGIN, 'Content-Type': 'application/json', 'X-CSRF-Token': data.csrfToken };
     expect((await invoke('/api/logout', { method: 'POST', headers: { ...good, Origin: 'https://evil.test' } })).status).toBe(403);
     const { Origin: _origin, ...missingOrigin } = good;
     expect((await invoke('/api/logout', { method: 'POST', headers: missingOrigin })).status).toBe(403);
     expect((await invoke('/api/logout', { method: 'POST', headers: { ...good, 'X-CSRF-Token': 'bad' } })).status).toBe(403);
-    expect((await invoke('/api/logout', { method: 'POST', headers: { ...good, 'Sec-Fetch-Site': 'cross-site' } })).status).toBe(403);
+    expect((await invoke('/api/logout', { method: 'POST', headers: { ...good, 'Sec-Fetch-Site': 'none' } })).status).toBe(403);
     expect((await invoke('/api/logout', { method: 'POST', headers: { ...good, 'Content-Type': 'text/plain' } })).status).toBe(403);
     const logout = await invoke('/api/logout', { method: 'POST', headers: good });
     expect(logout.status).toBe(200);
-    expect(logout.headers.get('Set-Cookie')).toContain('Max-Age=0');
+    expect(logout.headers.has('Set-Cookie')).toBe(false);
     expect((await invoke('/api/logout', { method: 'POST', headers: good })).status).toBe(401);
   });
 
   it('restricts preflight and fails closed on limit or missing configuration', async () => {
     const preflight = await invoke('/api/logout', { method: 'OPTIONS', headers: {
       Origin: config.SITE_ORIGIN, 'Access-Control-Request-Method': 'POST',
-      'Access-Control-Request-Headers': 'content-type,x-csrf-token'
+      'Access-Control-Request-Headers': 'authorization,content-type,x-csrf-token'
     } });
     expect(preflight.status).toBe(204);
     expect((await invoke('/api/logout', { method: 'OPTIONS', headers: {

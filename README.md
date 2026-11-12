@@ -45,14 +45,17 @@ displays an unavailable state.
 
 Authentication requires exact HTTPS site and API origins, an administrator's
 numeric GitHub ID, a GitHub OAuth client and a random CSRF secret. Real OAuth
-and host-only Secure cookies require separately approved HTTPS staging on
-same-site sibling hosts; plain localhost testing does not verify them.
-`github.io` and `workers.dev` are cross-site and third-party cookie blocking can
-prevent sign-in. Cloudflare's IP-based rate limits are approximate per location,
-not global, and shared IPs may be affected. A trusted Cloudflare-provided
-`CF-Connecting-IP` is required. The in-page editor and draft API are described
-below; the local Worker can retrieve published source through a server-side,
-read-only GitHub App integration. It never writes to GitHub or publishes content.
+uses a short-lived, high-entropy Bearer session held in page memory; it is not
+stored in a cookie, localStorage, or sessionStorage. The Secure, HttpOnly
+OAuth-transaction cookie is used only while completing the OAuth callback on
+the API host. The site and API may be cross-site (including `github.io` and
+`workers.dev`); API requests use an exact Origin allowlist, CORS, and CSRF
+protection rather than third-party session cookies. Reloading or navigating to
+another page clears the in-memory session and requires signing in again.
+Plain HTTP localhost does not verify the HTTPS OAuth callback or Secure-cookie
+behavior. Cloudflare's IP-based rate limits are approximate per location, not
+global, and shared IPs may be affected. A trusted Cloudflare-provided
+`CF-Connecting-IP` is required.
 
 ## In-page article editor and local drafts
 
@@ -60,86 +63,98 @@ Article pages stay statically generated and publicly readable. Editing controls
 load only after the configured HTTPS API confirms an `ADMIN` session through
 `GET /api/me`; the browser never decides its own role. Administrators can edit
 article metadata and the original Markdown/MDX source, preview it safely, and save
-an unpublished draft. The authenticated Worker uses `GET /api/admin/articles`
+an unpublished D1 draft. `Create pull request` submits a saved revision to a
+generated GitHub branch and creates or updates a PR targeting `master`; the
+Worker never merges it. Only review and merge publishes the article, after which
+the existing Pages workflow builds the `master` branch. The authenticated Worker uses `GET /api/admin/articles`
 and `GET /api/admin/articles/:id` to list articles and retrieve their exact
 source and Git blob SHA, then `POST /api/admin/drafts`,
 `PUT /api/admin/drafts/:id`, and `DELETE /api/admin/drafts/:id` for private draft
-management. These endpoints use the existing server-side ADMIN session and CSRF
-protections. D1 migrations `0003_article_drafts.sql` and
-`0004_draft_management.sql` preserve local drafts, track revisions, and record
-draft lifecycle audit events without article content. Drafts are not added to
-public pages, the Astro content collection, or GitHub.
+management, plus `POST /api/admin/drafts/:id/publish` for explicit PR submission.
+These endpoints use the existing server-side ADMIN session and CSRF protections.
+D1 migrations `0003_article_drafts.sql`, `0004_draft_management.sql`, and
+`0005_cross_site_auth_and_publication.sql` preserve drafts, track revisions,
+prevent stale-source publication, and record lifecycle events without article
+content. Drafts are not added to public pages or the Astro content collection;
+GitHub receives content only on the dedicated review branch after PR submission.
 
 The editor does not execute MDX or custom components in its preview. Raw HTML and
 JSX are shown as escaped source; Markdown image references are placeholders, and
-only an explicitly entered HTTPS cover URL may load in the preview. The editor
-and draft API have not been deployed remotely. To enable local published-source
-retrieval and safe new-draft collision checks, configure the optional GitHub App values listed in
-`worker/.dev.vars.example`; the App must be installed only on this repository
-with Contents read permission. Keep the private key in the ignored
-`worker/.dev.vars` file and never commit or log it. If the values are missing or
-GitHub is temporarily unavailable, the admin list still returns existing private
-drafts with `publishedSourceAvailable: false`; published-source reads and draft
-creation fail closed with `503`, while existing drafts can still be continued or
-deleted. Tests use generated keys and mocked GitHub responses, not a real App.
-Local Worker tests cover draft authorization, CSRF, validation, size limits,
-persistence, audit records, and revision conflicts.
-The existing HTTPS-only origin and Secure-cookie requirements still apply, so
-plain HTTP localhost does not provide a real browser-authenticated editing setup.
+only an explicitly entered HTTPS cover URL may load in the preview. Tests use
+generated keys and mocked GitHub responses, not a real App. Worker tests cover
+OAuth, handoff replay/expiry, draft authorization, CSRF, validation, persistence,
+stale-source conflicts, PR create/update/reopen, and merge synchronization.
 
-### Future Cloudflare deployment checklist (not configured or verified)
+### Cloudflare and GitHub setup
 
-The Worker config is local-only: its D1 ID is a placeholder, `workers_dev` is
-disabled, and no production route or hostname is configured. Do not deploy it
-as-is. A real setup requires separate approval and owner-supplied values:
+The production Worker, D1 database, OAuth app, and GitHub App are not provisioned
+by this repository. `worker/wrangler.jsonc` and `.dev.vars.example` are local
+development templates; do not deploy the local config. Start with
+`worker/wrangler.production.example.jsonc`, copy it to the ignored
+`worker/wrangler.production.jsonc`, and replace every `REPLACE_WITH_*` value.
+Do not commit credentials or private keys.
 
-1. Select and verify the approved custom domain with sibling HTTPS site and API
-   hosts. Do not use the GitHub Pages hostname with `workers.dev` for this
-   cookie-based cross-origin session design.
-2. Register a GitHub OAuth app using the exact callback
-   `https://<API_HOST>/auth/github/callback`; configure the site and API origin
-   variables to the exact HTTPS origins. The actual hostnames and callback are
-   intentionally unresolved, not inferred from examples.
-3. Create an environment-specific D1 database and replace the local placeholder
-   binding with its real database ID. Apply migrations to the intended database
-   only after explicit approval.
-4. Configure the `DB`, `AUTH_RATE_LIMITER`, and `WRITE_RATE_LIMITER` bindings,
-   an explicit Worker route/custom domain, and `SITE_ORIGIN`, `API_ORIGIN`,
-   `GITHUB_CLIENT_ID`, `ADMIN_GITHUB_IDS`, `GITHUB_APP_ID`, and
-   `GITHUB_APP_INSTALLATION_ID`. Set the site's
-   `PUBLIC_AUTH_API_ORIGIN` to the same API origin when building the static
-   admin page.
-5. Add `GITHUB_CLIENT_SECRET`, `GITHUB_APP_PRIVATE_KEY`, and a randomly
-   generated `CSRF_SECRET` (at least 32 bytes) as Worker secrets. The GitHub App
-   needs Contents read permission for this phase; do not grant write access.
-   Never commit or log secret values. Use a
-   verified numeric GitHub ID; the synthetic test identity is not an
-   administrator configuration.
-6. Only after separately approved provisioning and review, configure the
-   environment-specific Worker route and deploy it. Verify OAuth, cross-origin
-   cookies, revocation, and rate limits on trusted HTTPS staging before any
-   production use.
+1. Create a Cloudflare D1 database and set its returned ID in the production
+   config. The sample rate-limit namespace IDs are placeholders; configure
+   unique IDs for AUTH_RATE_LIMITER and WRITE_RATE_LIMITER in your account.
+   Keep `SITE_ORIGIN` as `https://kevinqcz.github.io`; set `API_ORIGIN` to the
+   exact HTTPS Worker URL, for example the assigned `workers.dev` hostname.
+2. Register a GitHub OAuth App with callback URL
+   `<API_ORIGIN>/auth/github/callback`. Put its client ID in the config and add
+   `GITHUB_CLIENT_SECRET` and a randomly generated `CSRF_SECRET` (at least 32
+   random bytes) as Worker secrets.
+3. Set `ADMIN_GITHUB_IDS` to the verified numeric GitHub user ID(s), not a
+   username. For example, `gh api users/LOGIN --jq .id` can retrieve a public
+   numeric ID; verify the result before using it.
+4. Create a GitHub App installed only on `KevinQCZ/KevinQCZ.github.io`, grant
+   Contents read/write and Pull requests read/write, and configure its App ID
+   and repository installation ID. Add `GITHUB_APP_PRIVATE_KEY` as a Worker
+   secret. The App writes only to generated draft branches and creates PRs
+   targeting `master`; it cannot merge them.
+5. Apply migrations and deploy from the copied production config after checking
+   every binding and origin:
 
-After approval, use the matching environment-specific config (never the local
-placeholder config) for the corresponding Wrangler steps:
+   ```sh
+   npx wrangler d1 create personal-site-admin-production
+   npx wrangler d1 migrations apply personal-site-admin-production --remote --config worker/wrangler.production.jsonc
+   npx wrangler secret put GITHUB_CLIENT_SECRET --config worker/wrangler.production.jsonc
+   npx wrangler secret put CSRF_SECRET --config worker/wrangler.production.jsonc
+   npx wrangler secret put GITHUB_APP_PRIVATE_KEY --config worker/wrangler.production.jsonc
+   npx wrangler deploy --config worker/wrangler.production.jsonc
+   ```
+6. Copy the deployed API origin into the repository Actions variable
+   `PUBLIC_AUTH_API_ORIGIN` under Settings → Secrets and variables → Actions →
+   Variables. The Pages workflow injects this public origin during the static
+   build; it is not a secret. The current published site remains readable even
+   before the variable is configured, but admin controls will show the service
+   as unavailable.
+7. Verify `/api/me` returns `401` when unauthenticated, complete sign-in and
+   logout on the deployed site, then test draft save, PR creation, review, and
+   merge using a harmless test article before relying on production.
 
-```sh
-npx wrangler d1 create <environment-database-name>
-npx wrangler d1 migrations apply <environment-database-name> --remote --config <environment-wrangler.jsonc>
-npx wrangler secret put GITHUB_CLIENT_SECRET --config <environment-wrangler.jsonc>
-npx wrangler secret put CSRF_SECRET --config <environment-wrangler.jsonc>
-npx wrangler deploy --config <environment-wrangler.jsonc>
-```
+No Cloudflare account details, D1 ID, rate-limit namespaces, OAuth/App
+credentials, or deployed Worker URL are present in this repository. The
+placeholders above are not production values; remote migrations and deployment
+must wait until you configure and verify the actual resources.
 
-Configure the required `SITE_ORIGIN`, `API_ORIGIN`, `GITHUB_CLIENT_ID`,
-`ADMIN_GITHUB_IDS`, D1 and rate-limit bindings, and Worker route in that
-environment config before these commands. The placeholders are not executable
-values. Do not apply a remote migration or deploy until the target environment,
-domain, callback, credentials and approval are confirmed.
+### Using the editor to publish
 
-These are prerequisites, not completed deployment instructions for an existing
-Cloudflare account: no domain, OAuth app, remote D1 database, Worker route,
-secrets, or staging environment has been supplied or provisioned.
+1. Open a published article on `https://kevinqcz.github.io/` and select **Sign in
+   with GitHub**. Complete GitHub authorization; the site returns to the article
+   and exposes edit controls only if the Worker confirms your allowlisted ADMIN
+   identity. On `/admin/`, sign in and use **Create new article** for a new post.
+2. Select **Edit article** or open a draft with **Continue editing**. Edit the
+   metadata and Markdown/MDX source, use **Preview** to check it, then choose
+   **Save Draft**. This stores a private D1 revision only; visitors still see
+   the published article.
+3. After saving, choose **Create pull request** (or **Update pull request** for
+   a previous submission). This writes the draft to its isolated GitHub branch
+   and opens a PR. Follow the **View pull request** link, inspect the rendered
+   change, and merge the PR only when it is ready to publish.
+4. The Pages workflow builds and deploys after the merge to `master`. Reload
+   the article or admin draft list to verify the published result. Signing in
+   again is required after a full page reload or navigation because session
+   tokens are memory-only.
 
 ## Writing articles
 

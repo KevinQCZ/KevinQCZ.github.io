@@ -31,6 +31,8 @@ jobs:
       - name: Check Astro and TypeScript
         run: npm run check
       - name: Build and validate site
+        env:
+          PUBLIC_AUTH_API_ORIGIN: ${{ vars.PUBLIC_AUTH_API_ORIGIN }}
         run: npm run build
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5

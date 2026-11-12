@@ -1,8 +1,12 @@
 import { articleMetadataSchema } from '../../src/lib/article-schema';
 import {
   getPublishedArticle,
+  getPullRequest,
+  GitHubSourceError,
   listPublishedArticles,
+  publishArticleDraft,
   publishedArticleConflicts,
+  type ArticlePublicationInput,
   validArticlePath,
   type GitHubAppConfig,
   type PublishedArticle
@@ -69,19 +73,23 @@ interface StoredArticleDraft extends Omit<ArticleDraft, 'expectedRevision' | 'co
   id: string;
   articlePath: string | null;
   baseSha: string | null;
-  status: 'DRAFT';
+  status: 'DRAFT' | 'PENDING_PUBLICATION' | 'PUBLISHED' | 'UNPUBLISHED';
   permalink: string;
   coverUrl: string | null;
   revision: number;
   createdAt: number;
   updatedAt: number;
+  publicationState: 'NOT_SUBMITTED' | 'OPEN' | 'CLOSED' | 'MERGED';
+  pullRequestNumber: number | null;
+  pullRequestUrl: string | null;
+  submittedRevision: number | null;
 }
 
 interface DraftRow {
   id: string;
   article_path: string | null;
   base_sha: string | null;
-  status: 'DRAFT';
+  status: 'DRAFT' | 'PENDING_PUBLICATION' | 'PUBLISHED' | 'UNPUBLISHED';
   permalink: string;
   source_format: 'md' | 'mdx';
   title: string;
@@ -96,16 +104,26 @@ interface DraftRow {
   updated_at: number;
   created_by: string | null;
   updated_by: string | null;
+  publication_branch: string | null;
+  pull_request_number: number | null;
+  pull_request_url: string | null;
+  publication_state: 'NOT_SUBMITTED' | 'OPEN' | 'CLOSED' | 'MERGED';
+  published_sha: string | null;
+  submitted_revision: number | null;
+  publication_lock: string | null;
+  publication_lock_expires_at: number | null;
 }
 
 const DRAFT_COLUMNS = `id, article_path, base_sha, status, permalink, source_format, title,
   description, published_at, categories_json, tags_json, cover_url, body, revision,
-  created_at, updated_at, created_by, updated_by`;
+  created_at, updated_at, created_by, updated_by, publication_branch,
+  pull_request_number, pull_request_url, publication_state, published_sha,
+  submitted_revision, publication_lock, publication_lock_expires_at`;
 
-const SESSION_COOKIE = '__Host-admin_session';
 const TRANSACTION_COOKIE = '__Host-oauth_transaction';
-const SESSION_SECONDS = 24 * 60 * 60;
+const SESSION_SECONDS = 60 * 60;
 const TRANSACTION_SECONDS = 10 * 60;
+const HANDOFF_SECONDS = 2 * 60;
 const MAX_DRAFT_REQUEST_BYTES = 400 * 1024;
 const MAX_DRAFT_BODY_BYTES = 256 * 1024;
 const encoder = new TextEncoder();
@@ -180,7 +198,6 @@ function headers(request: Request, cfg: Config): Headers {
   });
   if (request.headers.get('Origin') === cfg.site) {
     result.set('Access-Control-Allow-Origin', cfg.site);
-    result.set('Access-Control-Allow-Credentials', 'true');
   }
   return result;
 }
@@ -213,8 +230,10 @@ export async function requireAuthentication(
   env: Env,
   cfg: Config
 ): Promise<AuthContext | Response> {
-  const token = cookieValue(request, SESSION_COOKIE);
-  if (!token) return error(request, cfg, 401, 'unauthorized');
+  const authorization = request.headers.get('Authorization') || '';
+  const match = /^Bearer ([A-Za-z0-9_-]{43})$/.exec(authorization);
+  if (!match) return error(request, cfg, 401, 'unauthorized');
+  const token = match[1];
   const now = Date.now();
   const record = await env.DB.prepare(
     `UPDATE admin_sessions SET last_used_at = ?
@@ -292,9 +311,41 @@ async function adminArticleList(request: Request, env: Env, cfg: Config): Promis
       publishedSourceError = 'unavailable';
     }
   }
+  if (cfg.githubApp && publishedSourceError === null) {
+    const pending = await env.DB.prepare(
+      `SELECT id, article_path, revision, submitted_revision, pull_request_number
+       FROM article_drafts WHERE status = 'PENDING_PUBLICATION'
+       AND pull_request_number IS NOT NULL ORDER BY updated_at DESC LIMIT 20`
+    ).all<Pick<DraftRow, 'id' | 'article_path' | 'revision' | 'submitted_revision' | 'pull_request_number'>>();
+    for (const draft of pending.results) {
+      try {
+        const pullRequest = await getPullRequest(cfg.githubApp, draft.pull_request_number!);
+        if (pullRequest.state === 'MERGED') {
+          const currentFile = articles.find((article) => article.articlePath === draft.article_path);
+          if (!currentFile) continue;
+          const isLatestRevision = draft.revision === draft.submitted_revision;
+          await env.DB.prepare(
+            `UPDATE article_drafts SET status = ?, publication_state = 'MERGED',
+             publication_branch = CASE WHEN ? = 1 THEN publication_branch ELSE NULL END,
+             base_sha = ?, published_sha = ?, publication_lock = NULL,
+             publication_lock_expires_at = NULL
+             WHERE id = ? AND status = 'PENDING_PUBLICATION'`
+          ).bind(isLatestRevision ? 'PUBLISHED' : 'DRAFT', isLatestRevision ? 1 : 0,
+            currentFile.sha, pullRequest.mergeCommitSha, draft.id).run();
+        } else {
+          await env.DB.prepare(
+            `UPDATE article_drafts SET publication_state = ?
+             WHERE id = ? AND status = 'PENDING_PUBLICATION'`
+          ).bind(pullRequest.state, draft.id).run();
+        }
+      } catch {
+        publishedSourceError = 'unavailable';
+      }
+    }
+  }
   const drafts = await env.DB.prepare(
     `SELECT ${DRAFT_COLUMNS} FROM article_drafts
-     WHERE status = 'DRAFT' ORDER BY updated_at DESC LIMIT 200`
+     WHERE status IN ('DRAFT', 'PENDING_PUBLICATION') ORDER BY updated_at DESC LIMIT 200`
   ).all<DraftRow>();
   return json(request, cfg, 200, {
     articles,
@@ -313,7 +364,8 @@ async function adminArticleDetail(
 ): Promise<Response> {
   if (/^d_[a-f0-9-]{32,36}$/i.test(id)) {
     const row = await env.DB.prepare(
-      `SELECT ${DRAFT_COLUMNS} FROM article_drafts WHERE id = ? AND status = 'DRAFT'`
+      `SELECT ${DRAFT_COLUMNS} FROM article_drafts
+       WHERE id = ? AND status IN ('DRAFT', 'PENDING_PUBLICATION')`
     ).bind(id.slice(2)).first<DraftRow>();
     if (!row) return error(request, cfg, 404, 'not_found');
     await auditDraft(env, userId, 'draft.preview', row.id);
@@ -330,7 +382,8 @@ async function adminArticleDetail(
   if (!article) return error(request, cfg, 404, 'not_found');
   const row = await env.DB.prepare(
     `SELECT ${DRAFT_COLUMNS} FROM article_drafts
-     WHERE article_path = ? OR permalink = ?
+     WHERE status IN ('DRAFT', 'PENDING_PUBLICATION')
+       AND (article_path = ? OR permalink = ?)
      ORDER BY CASE WHEN article_path = ? THEN 0 ELSE 1 END LIMIT 1`
   ).bind(article.articlePath, article.permalink, article.articlePath).first<DraftRow>();
   if (row) await auditDraft(env, userId, 'draft.preview', row.id);
@@ -383,9 +436,36 @@ async function createManagedDraft(
   }
 
   const existing = await env.DB.prepare(
-    'SELECT id FROM article_drafts WHERE permalink = ? OR article_path = ? LIMIT 1'
-  ).bind(input.permalink, articlePath).first<{ id: string }>();
-  if (existing) return error(request, cfg, 409, 'draft_exists');
+    `SELECT ${DRAFT_COLUMNS} FROM article_drafts
+     WHERE permalink = ? OR article_path = ? LIMIT 1`
+  ).bind(input.permalink, articlePath).first<DraftRow>();
+  if (existing) {
+    if (existing.status !== 'PUBLISHED' || !input.articleId) return error(request, cfg, 409, 'draft_exists');
+    const [reset] = await env.DB.batch([
+      env.DB.prepare(
+        `UPDATE article_drafts SET article_path = ?, base_sha = ?, status = 'DRAFT',
+         source_format = ?, title = ?, description = ?, published_at = ?, categories_json = ?,
+         tags_json = ?, cover_url = ?, body = ?, revision = revision + 1, updated_at = ?,
+         updated_by = ?, publication_branch = NULL, pull_request_number = NULL,
+         pull_request_url = NULL, publication_state = 'NOT_SUBMITTED', published_sha = NULL,
+         submitted_revision = NULL
+         WHERE id = ? AND status = 'PUBLISHED'`
+      ).bind(articlePath, baseSha, sourceFormat, input.title, input.description, input.publishedAt,
+        JSON.stringify(input.categories), JSON.stringify(input.tags), input.coverUrl, input.body,
+        Date.now(), userId, existing.id),
+      env.DB.prepare(
+        `INSERT INTO audit_logs
+         (id, github_user_id, action, created_at, result, resource_type, resource_id)
+         SELECT ?, ?, 'draft.create', ?, 'success', 'draft', ? WHERE changes() = 1`
+      ).bind(crypto.randomUUID(), userId, Date.now(), existing.id)
+    ]);
+    if (reset.meta.changes !== 1) return error(request, cfg, 409, 'draft_exists');
+    const row = await env.DB.prepare(
+      `SELECT ${DRAFT_COLUMNS} FROM article_drafts WHERE id = ?`
+    ).bind(existing.id).first<DraftRow>();
+    if (!row) return error(request, cfg, 503, 'draft_save_failed');
+    return json(request, cfg, 201, { draft: storedDraft(row) });
+  }
 
   const id = crypto.randomUUID();
   const now = Date.now();
@@ -429,7 +509,8 @@ async function updateManagedDraft(
     return error(request, cfg, 400, 'invalid_draft');
   }
   const existing = await env.DB.prepare(
-    `SELECT ${DRAFT_COLUMNS} FROM article_drafts WHERE id = ? AND status = 'DRAFT'`
+    `SELECT ${DRAFT_COLUMNS} FROM article_drafts
+     WHERE id = ? AND status IN ('DRAFT', 'PENDING_PUBLICATION')`
   ).bind(id).first<DraftRow>();
   if (!existing) return error(request, cfg, 404, 'not_found');
   if (input.permalink !== existing.permalink || input.sourceFormat !== existing.source_format) {
@@ -441,10 +522,11 @@ async function updateManagedDraft(
       `UPDATE article_drafts
        SET title = ?, description = ?, published_at = ?, categories_json = ?, tags_json = ?,
            cover_url = ?, body = ?, revision = revision + 1, updated_at = ?, updated_by = ?
-       WHERE id = ? AND revision = ? AND status = 'DRAFT'`
+       WHERE id = ? AND revision = ? AND status IN ('DRAFT', 'PENDING_PUBLICATION')
+         AND (publication_lock IS NULL OR publication_lock_expires_at <= ?)`
     ).bind(
       input.title, input.description, input.publishedAt, JSON.stringify(input.categories),
-      JSON.stringify(input.tags), input.coverUrl, input.body, now, userId, id, input.expectedRevision
+      JSON.stringify(input.tags), input.coverUrl, input.body, now, userId, id, input.expectedRevision, now
     ),
     env.DB.prepare(
       `INSERT INTO audit_logs
@@ -466,6 +548,114 @@ async function updateManagedDraft(
   return json(request, cfg, 200, { draft: storedDraft(row) });
 }
 
+function publicationBranch(draftId: string, revision: number): string {
+  return `blog/draft-${draftId.slice(2).replaceAll('-', '')}-r${revision}`;
+}
+
+async function publishManagedDraft(
+  request: Request,
+  env: Env,
+  cfg: Config,
+  userId: string,
+  id: string,
+  payload: unknown
+): Promise<Response> {
+  if (!cfg.githubApp) return sourceUnavailable(request, cfg);
+  if (!isRecord(payload) || typeof payload.expectedRevision !== 'number' ||
+      !Number.isSafeInteger(payload.expectedRevision) || payload.expectedRevision < 1) {
+    return error(request, cfg, 400, 'invalid_draft');
+  }
+  const row = await env.DB.prepare(
+    `SELECT ${DRAFT_COLUMNS} FROM article_drafts
+     WHERE id = ? AND status IN ('DRAFT', 'PENDING_PUBLICATION')`
+  ).bind(id).first<DraftRow>();
+  if (!row) return error(request, cfg, 404, 'not_found');
+  if (row.revision !== payload.expectedRevision) return error(request, cfg, 409, 'revision_conflict');
+  if (!row.article_path || !validArticlePath(row.article_path) ||
+      !row.article_path.endsWith(`.${row.source_format}`)) {
+    return error(request, cfg, 400, 'invalid_article_path');
+  }
+
+  const trackedBranch = row.publication_state === 'MERGED' ? null : row.publication_branch;
+  const branch = trackedBranch ?? publicationBranch(`d_${row.id}`, row.revision);
+  if (!/^blog\/draft-[a-f0-9]{32}-r[1-9]\d*$/i.test(branch)) {
+    return error(request, cfg, 409, 'invalid_publication_branch');
+  }
+  const lock = crypto.randomUUID();
+  const now = Date.now();
+  const [acquired] = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE article_drafts SET publication_lock = ?, publication_lock_expires_at = ?,
+       publication_branch = ?
+       WHERE id = ? AND revision = ? AND status IN ('DRAFT', 'PENDING_PUBLICATION')
+         AND (publication_lock IS NULL OR publication_lock_expires_at <= ?)`
+    ).bind(lock, now + 5 * 60 * 1000, branch, id, row.revision, now)
+  ]);
+  if (acquired.meta.changes !== 1) return error(request, cfg, 409, 'publication_in_progress');
+
+  try {
+    const article: ArticlePublicationInput = {
+      draftId: `d_${row.id}`,
+      revision: row.revision,
+      articlePath: row.article_path,
+      sourceFormat: row.source_format,
+      baseSha: row.base_sha,
+      title: row.title,
+      description: row.description,
+      publishedAt: row.published_at,
+      permalink: row.permalink,
+      categories: JSON.parse(row.categories_json) as string[],
+      tags: JSON.parse(row.tags_json) as string[],
+      coverUrl: row.cover_url,
+      body: row.body
+    };
+    const result = await publishArticleDraft(
+      cfg.githubApp,
+      article,
+      trackedBranch,
+      row.publication_state === 'OPEN' || row.publication_state === 'CLOSED'
+        ? row.pull_request_number
+        : null
+    );
+    const [updated] = await env.DB.batch([
+      env.DB.prepare(
+        `UPDATE article_drafts SET status = 'PENDING_PUBLICATION',
+         publication_state = 'OPEN', publication_branch = ?, pull_request_number = ?,
+         pull_request_url = ?, submitted_revision = ?, published_sha = NULL,
+         publication_lock = NULL, publication_lock_expires_at = NULL
+         WHERE id = ? AND revision = ? AND publication_lock = ?`
+      ).bind(result.branch, result.pullRequest.number, result.pullRequest.url,
+        row.revision, id, row.revision, lock),
+      env.DB.prepare(
+        `INSERT INTO audit_logs
+         (id, github_user_id, action, created_at, result, resource_type, resource_id)
+         SELECT ?, ?, 'draft.publish', ?, 'success', 'draft', ? WHERE changes() = 1`
+      ).bind(crypto.randomUUID(), userId, Date.now(), id)
+    ]);
+    if (updated.meta.changes !== 1) return error(request, cfg, 409, 'revision_conflict');
+    const saved = await env.DB.prepare(
+      `SELECT ${DRAFT_COLUMNS} FROM article_drafts WHERE id = ?`
+    ).bind(id).first<DraftRow>();
+    if (!saved) return error(request, cfg, 503, 'draft_save_failed');
+    return json(request, cfg, 200, {
+      draft: storedDraft(saved),
+      pullRequest: result.pullRequest
+    });
+  } catch (cause) {
+    const resetBranch = cause instanceof GitHubSourceError && cause.code === 'branch_conflict';
+    await env.DB.prepare(
+      `UPDATE article_drafts SET publication_lock = NULL, publication_lock_expires_at = NULL,
+       publication_branch = CASE WHEN ? = 1 THEN NULL ELSE publication_branch END
+       WHERE id = ? AND publication_lock = ?`
+    ).bind(resetBranch ? 1 : 0, id, lock).run();
+    if (cause instanceof GitHubSourceError) {
+      return error(request, cfg, cause.status && cause.status >= 400 && cause.status < 500 ? cause.status : 503,
+        cause.code || 'github_publication_unavailable');
+    }
+    return error(request, cfg, 503, 'github_publication_unavailable');
+  }
+}
+
 async function deleteManagedDraft(
   request: Request,
   env: Env,
@@ -475,7 +665,10 @@ async function deleteManagedDraft(
 ): Promise<Response> {
   const now = Date.now();
   const [deleted] = await env.DB.batch([
-    env.DB.prepare('DELETE FROM article_drafts WHERE id = ? AND status = \'DRAFT\'').bind(id),
+    env.DB.prepare(
+      `DELETE FROM article_drafts WHERE id = ? AND status = 'DRAFT'
+       AND (publication_lock IS NULL OR publication_lock_expires_at <= ?)`
+    ).bind(id, now),
     env.DB.prepare(
       `INSERT INTO audit_logs
        (id, github_user_id, action, created_at, result, resource_type, resource_id)
@@ -623,26 +816,7 @@ function parseManagedDraft(value: unknown): ManagedDraftInput | null {
   return { ...draft, permalink, articleId: typeof articleId === 'string' ? articleId : null };
 }
 
-function storedDraft(row: {
-  id: string;
-  article_path: string | null;
-  base_sha: string | null;
-  status: 'DRAFT';
-  permalink: string;
-  source_format: 'md' | 'mdx';
-  title: string;
-  description: string;
-  published_at: string;
-  categories_json: string;
-  tags_json: string;
-  cover_url: string | null;
-  body: string;
-  revision: number;
-  created_at: number;
-  updated_at: number;
-  created_by: string | null;
-  updated_by: string | null;
-}): StoredArticleDraft {
+function storedDraft(row: DraftRow): StoredArticleDraft {
   return {
     id: `d_${row.id}`,
     articlePath: row.article_path,
@@ -659,20 +833,30 @@ function storedDraft(row: {
     body: row.body,
     revision: row.revision,
     createdAt: row.created_at,
-    updatedAt: row.updated_at
+    updatedAt: row.updated_at,
+    publicationState: row.publication_state,
+    pullRequestNumber: row.pull_request_number,
+    pullRequestUrl: row.pull_request_url,
+    submittedRevision: row.submitted_revision
   };
 }
 
 async function start(request: Request, env: Env, cfg: Config): Promise<Response> {
   if (!await limit(request, env.AUTH_RATE_LIMITER, 'start')) return error(request, cfg, 429, 'rate_limited');
+  const startUrl = new URL(request.url);
+  const returnToValues = startUrl.searchParams.getAll('return_to');
+  if (returnToValues.length > 1) return error(request, cfg, 400, 'invalid_return_path');
+  const returnTo = safeReturnPath(returnToValues[0] ?? null, cfg);
+  if (!returnTo) return error(request, cfg, 400, 'invalid_return_path');
   const state = randomToken();
   const browser = randomToken();
   const verifier = randomToken();
   const now = Date.now();
   await env.DB.batch([
     env.DB.prepare('DELETE FROM oauth_transactions WHERE expires_at <= ?').bind(now),
-    env.DB.prepare('INSERT INTO oauth_transactions (state_hash, binding_hash, verifier, expires_at) VALUES (?, ?, ?, ?)')
-      .bind(await hash(state), await hash(browser), verifier, now + TRANSACTION_SECONDS * 1000)
+    env.DB.prepare(
+      'INSERT INTO oauth_transactions (state_hash, binding_hash, verifier, return_to, expires_at) VALUES (?, ?, ?, ?, ?)'
+    ).bind(await hash(state), await hash(browser), verifier, returnTo, now + TRANSACTION_SECONDS * 1000)
   ]);
   const url = new URL('https://github.com/login/oauth/authorize');
   url.search = new URLSearchParams({
@@ -698,8 +882,11 @@ async function callback(request: Request, env: Env, cfg: Config): Promise<Respon
   ) return error(request, cfg, 400, 'invalid_callback');
 
   const transaction = await env.DB.prepare(
-    'DELETE FROM oauth_transactions WHERE state_hash = ? AND binding_hash = ? AND expires_at > ? RETURNING verifier'
-  ).bind(await hash(state), await hash(browser), Date.now()).first<{ verifier: string }>();
+    `DELETE FROM oauth_transactions
+     WHERE state_hash = ? AND binding_hash = ? AND expires_at > ?
+     RETURNING verifier, return_to`
+  ).bind(await hash(state), await hash(browser), Date.now())
+    .first<{ verifier: string; return_to: string }>();
   if (!transaction) return error(request, cfg, 400, 'invalid_callback');
 
   const exchange = await fetch('https://github.com/login/oauth/access_token', {
@@ -732,30 +919,94 @@ async function callback(request: Request, env: Env, cfg: Config): Promise<Respon
   const login = user.login;
   if (!cfg.allowedIds.has(userId)) {
     await audit(env, 'login', 'denied', userId);
-    return error(request, cfg, 403, 'forbidden');
+    const returnTo = safeReturnPath(transaction.return_to, cfg) ?? '/admin/';
+    return redirect(request, cfg, `${cfg.site}${returnTo}#copilot_auth_error=forbidden`, [
+      cookie(TRANSACTION_COOKIE, '', 0)
+    ]);
   }
-  const oldToken = cookieValue(request, SESSION_COOKIE);
-  const newToken = randomToken();
+  const handoff = randomToken();
   const now = Date.now();
-  const statements = [];
-  if (oldToken) statements.push(env.DB.prepare('DELETE FROM admin_sessions WHERE session_hash = ?').bind(await hash(oldToken)));
-  statements.push(
-    env.DB.prepare('INSERT INTO admin_sessions (id, github_user_id, github_login, session_hash, expires_at, created_at, last_used_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-      .bind(crypto.randomUUID(), userId, login, await hash(newToken), now + SESSION_SECONDS * 1000, now, now),
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM oauth_handoffs WHERE expires_at <= ?').bind(now),
+    env.DB.prepare(
+      'INSERT INTO oauth_handoffs (code_hash, github_user_id, github_login, expires_at, created_at) VALUES (?, ?, ?, ?, ?)'
+    ).bind(await hash(handoff), userId, login, now + HANDOFF_SECONDS * 1000, now),
     env.DB.prepare('INSERT INTO audit_logs (id, github_user_id, action, created_at, result) VALUES (?, ?, ?, ?, ?)')
       .bind(crypto.randomUUID(), userId, 'login', now, 'success')
-  );
-  await env.DB.batch(statements);
-  return redirect(request, cfg, `${cfg.site}/admin/`, [
-    cookie(TRANSACTION_COOKIE, '', 0), cookie(SESSION_COOKIE, newToken, SESSION_SECONDS)
   ]);
+  const returnTo = safeReturnPath(transaction.return_to, cfg) ?? '/admin/';
+  return redirect(request, cfg, `${cfg.site}${returnTo}#copilot_auth=${handoff}`, [
+    cookie(TRANSACTION_COOKIE, '', 0)
+  ]);
+}
+
+async function exchangeHandoff(request: Request, env: Env, cfg: Config): Promise<Response> {
+  if (!validUnsafeRequest(request, cfg)) return error(request, cfg, 403, 'forbidden');
+  if (!await limit(request, env.AUTH_RATE_LIMITER, 'exchange')) return error(request, cfg, 429, 'rate_limited');
+  let payload: unknown;
+  try {
+    payload = await requestJson(request);
+  } catch (cause) {
+    return cause instanceof PayloadTooLargeError
+      ? error(request, cfg, 413, 'payload_too_large')
+      : error(request, cfg, 400, 'invalid_json');
+  }
+  if (!isRecord(payload) || typeof payload.code !== 'string' ||
+      !/^[A-Za-z0-9_-]{43}$/.test(payload.code)) {
+    return error(request, cfg, 400, 'invalid_handoff');
+  }
+  const now = Date.now();
+  const handoff = await env.DB.prepare(
+    `DELETE FROM oauth_handoffs WHERE code_hash = ? AND expires_at > ?
+     RETURNING github_user_id, github_login`
+  ).bind(await hash(payload.code), now).first<{ github_user_id: string; github_login: string }>();
+  if (!handoff || !cfg.allowedIds.has(handoff.github_user_id)) {
+    return error(request, cfg, handoff ? 403 : 400, handoff ? 'forbidden' : 'invalid_handoff');
+  }
+  const token = randomToken();
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO admin_sessions
+       (id, github_user_id, github_login, session_hash, expires_at, created_at, last_used_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).bind(crypto.randomUUID(), handoff.github_user_id, handoff.github_login,
+      await hash(token), now + SESSION_SECONDS * 1000, now, now),
+    env.DB.prepare('INSERT INTO audit_logs (id, github_user_id, action, created_at, result) VALUES (?, ?, ?, ?, ?)')
+      .bind(crypto.randomUUID(), handoff.github_user_id, 'session.create', now, 'success')
+  ]);
+  return json(request, cfg, 200, {
+    token,
+    authenticated: true,
+    user: {
+      githubId: handoff.github_user_id,
+      githubLogin: handoff.github_login,
+      role: 'ADMIN'
+    },
+    csrfToken: await csrf(token, cfg.csrfSecret)
+  });
 }
 
 function validUnsafeRequest(request: Request, cfg: Config): boolean {
   const fetchSite = request.headers.get('Sec-Fetch-Site');
   return request.headers.get('Origin') === cfg.site &&
-    (!fetchSite || fetchSite === 'same-site' || fetchSite === 'same-origin') &&
+    (!fetchSite || ['cross-site', 'same-site', 'same-origin'].includes(fetchSite)) &&
     /^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(request.headers.get('Content-Type') || '');
+}
+
+function safeReturnPath(value: string | null, cfg: Config): string | null {
+  if (value === null) return '/admin/';
+  if (!value.startsWith('/') || value.startsWith('//') || value.includes('\\') ||
+      /[\u0000-\u001f]/.test(value)) return null;
+  try {
+    const target = new URL(value, cfg.site);
+    if (target.origin !== cfg.site || target.search || target.hash) return null;
+    if (target.pathname === '/admin/' || target.pathname === '/admin') return '/admin/';
+    return /^\/\d{4}\/\d{2}\/\d{2}\/[A-Za-z0-9][A-Za-z0-9-]*\/?$/.test(target.pathname)
+      ? target.pathname
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 async function handle(request: Request, env: Env, cfg: Config): Promise<Response> {
@@ -767,17 +1018,20 @@ async function handle(request: Request, env: Env, cfg: Config): Promise<Response
     const requestedHeaders = (request.headers.get('Access-Control-Request-Headers') || '')
       .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
     if (request.headers.get('Origin') !== cfg.site || !['GET', 'POST', 'PUT', 'DELETE'].includes(method || '') ||
-        requestedHeaders.some((h) => !['content-type', 'x-csrf-token'].includes(h))) {
+        requestedHeaders.some((h) => !['authorization', 'content-type', 'x-csrf-token'].includes(h))) {
       return error(request, cfg, 403, 'forbidden');
     }
     const h = headers(request, cfg);
     h.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    h.set('Access-Control-Allow-Headers', 'Content-Type, X-CSRF-Token');
+    h.set('Access-Control-Allow-Headers', 'Authorization, Content-Type, X-CSRF-Token');
     h.set('Vary', 'Origin, Access-Control-Request-Method, Access-Control-Request-Headers');
     return new Response(null, { status: 204, headers: h });
   }
   if (path === '/auth/github' && request.method === 'GET') return start(request, env, cfg);
   if (path === '/auth/github/callback' && request.method === 'GET') return callback(request, env, cfg);
+  if (path === '/api/auth/exchange' && request.method === 'POST') {
+    return exchangeHandoff(request, env, cfg);
+  }
   if (
     path === '/api/me' || path === '/api/logout' ||
     path === '/api/admin' || path.startsWith('/api/admin/')
@@ -826,6 +1080,30 @@ async function handle(request: Request, env: Env, cfg: Config): Promise<Response
       }
       return createManagedDraft(request, env, cfg, auth.session.github_user_id, payload);
     }
+    const publicationMatch = /^\/api\/admin\/drafts\/([^/]+)\/publish$/.exec(routePath);
+    if (publicationMatch && request.method === 'POST') {
+      let id: string;
+      try {
+        id = decodeURIComponent(publicationMatch[1]);
+      } catch {
+        return error(request, cfg, 400, 'invalid_draft_id');
+      }
+      if (!/^d_[a-f0-9-]{32,36}$/i.test(id)) return error(request, cfg, 400, 'invalid_draft_id');
+      const csrfError = await requireCsrfProtection(request, auth, cfg);
+      if (csrfError) return csrfError;
+      if (!await limit(request, env.WRITE_RATE_LIMITER, 'draft-publish')) {
+        return error(request, cfg, 429, 'rate_limited');
+      }
+      let payload: unknown;
+      try {
+        payload = await requestJson(request);
+      } catch (cause) {
+        return cause instanceof PayloadTooLargeError
+          ? error(request, cfg, 413, 'payload_too_large')
+          : error(request, cfg, 400, 'invalid_json');
+      }
+      return publishManagedDraft(request, env, cfg, auth.session.github_user_id, id.slice(2), payload);
+    }
     const draftMatch = /^\/api\/admin\/drafts\/([^/]+)$/.exec(routePath);
     if (draftMatch && (request.method === 'PUT' || request.method === 'DELETE')) {
       let id: string;
@@ -860,7 +1138,7 @@ async function handle(request: Request, env: Env, cfg: Config): Promise<Response
       }
       const row = await env.DB.prepare(
         `SELECT ${DRAFT_COLUMNS}
-         FROM article_drafts WHERE permalink = ? AND status = 'DRAFT'`
+         FROM article_drafts WHERE permalink = ? AND status IN ('DRAFT', 'PENDING_PUBLICATION')`
       ).bind(permalink[0]).first<DraftRow>();
       if (!row) return error(request, cfg, 404, 'not_found');
       await auditDraft(env, auth.session.github_user_id, 'draft.preview', row.id);
@@ -909,8 +1187,10 @@ async function handle(request: Request, env: Env, cfg: Config): Promise<Response
            SET source_format = ?, title = ?, description = ?, published_at = ?, categories_json = ?,
                  tags_json = ?, cover_url = ?, body = ?, revision = revision + 1, updated_at = ?,
                  updated_by = ?
-           WHERE permalink = ? AND revision = ? AND status = 'DRAFT'`
-          ).bind(...values, now, auth.session.github_user_id, permalink, draft.expectedRevision);
+           WHERE permalink = ? AND revision = ?
+             AND status IN ('DRAFT', 'PENDING_PUBLICATION')
+             AND (publication_lock IS NULL OR publication_lock_expires_at <= ?)`
+          ).bind(...values, now, auth.session.github_user_id, permalink, draft.expectedRevision, now);
       const [writeResult] = await env.DB.batch([
         write,
         env.DB.prepare(
@@ -944,9 +1224,7 @@ async function handle(request: Request, env: Env, cfg: Config): Promise<Response
           .bind(crypto.randomUUID(), auth.session.github_user_id, 'logout', Date.now(), 'success')
       ]);
       if (deleted.meta.changes !== 1) return error(request, cfg, 401, 'unauthorized');
-      const response = json(request, cfg, 200, { ok: true });
-      response.headers.append('Set-Cookie', cookie(SESSION_COOKIE, '', 0));
-      return response;
+      return json(request, cfg, 200, { ok: true });
     }
     return error(request, cfg, 404, 'not_found');
   }

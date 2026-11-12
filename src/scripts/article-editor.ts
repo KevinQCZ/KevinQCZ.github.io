@@ -5,6 +5,13 @@ import type {
   ArticleLocator,
   ArticleSeed
 } from './article-editor-types';
+import {
+  AdminAuthError,
+  adminFetch,
+  authErrorMessage,
+  githubLoginUrl,
+  initializeAdminSession
+} from './admin-auth';
 
 interface EditorModule {
   mountArticleEditorUi: (
@@ -64,7 +71,8 @@ function isArticleDraft(value: unknown): value is ArticleDraft {
 function isAdminSession(value: unknown): value is AdminSession {
   if (!value || typeof value !== 'object') return false;
   const response = value as Partial<AdminSession>;
-  return typeof response.csrfToken === 'string' && response.csrfToken.length > 0 &&
+  return typeof response.accessToken === 'string' && response.accessToken.length > 0 &&
+    typeof response.csrfToken === 'string' && response.csrfToken.length > 0 &&
     typeof response.user?.githubId === 'string' &&
     typeof response.user.githubLogin === 'string' && response.user.githubLogin.length > 0 &&
     response.user.role === 'ADMIN';
@@ -98,13 +106,18 @@ export async function mountArticleEditor(
   if (!isArticleLocator(locator)) return;
 
   try {
-    const response = await fetcher(`${apiOrigin}/api/me`, { credentials: 'include' });
-    if (!response.ok) return;
-    const session = await response.json();
+    const session = await initializeAdminSession(apiOrigin, fetcher);
+    if (!session) {
+      showSignIn(root, apiOrigin, window.location.pathname, 'Administrator sign-in is required to edit this article.');
+      return;
+    }
     if (!isAdminSession(session)) return;
-    const detailResponse = await fetcher(
-      `${apiOrigin}/api/admin/articles/${encodeURIComponent(locator.articleId)}`,
-      { credentials: 'include' }
+    const detailResponse = await adminFetch(
+      apiOrigin,
+      `/api/admin/articles/${encodeURIComponent(locator.articleId)}`,
+      {},
+      fetcher,
+      session
     );
     if (!detailResponse.ok) return;
     const detail = await detailResponse.json() as Partial<AdminArticleDetail>;
@@ -113,7 +126,26 @@ export async function mountArticleEditor(
         (detail.draft !== null && !isArticleDraft(detail.draft))) return;
     const editor = await loadEditor();
     await editor.mountArticleEditorUi(root, apiOrigin, detail.article, session, fetcher, detail.draft);
-  } catch {
-    // Public article rendering remains available when the admin service is not.
+  } catch (cause) {
+    showSignIn(
+      root,
+      apiOrigin,
+      window.location.pathname,
+      cause instanceof AdminAuthError ? authErrorMessage(cause.code) : 'The administrator service is unavailable.'
+    );
   }
+}
+
+function showSignIn(root: HTMLElement, apiOrigin: string, returnTo: string, message: string): void {
+  const prompt = document.createElement('div');
+  prompt.className = 'article-editor-bar';
+  const status = document.createElement('p');
+  status.setAttribute('role', 'status');
+  status.textContent = message;
+  const link = document.createElement('a');
+  link.className = 'button-secondary';
+  link.href = githubLoginUrl(apiOrigin, returnTo);
+  link.textContent = 'Sign in with GitHub to edit';
+  prompt.append(status, link);
+  root.replaceChildren(prompt);
 }
