@@ -47,7 +47,7 @@ beforeEach(async () => {
       expect(init?.method).toBe('POST');
       return Response.json({ access_token: 'dummy-oauth-token' });
     }
-    if (input === 'https://api.github.com/user') return Response.json({ id: 123 });
+    if (input === 'https://api.github.com/user') return Response.json({ id: 123, login: 'approved-user' });
     throw new Error('Unexpected provider URL');
   });
 });
@@ -71,8 +71,10 @@ describe('OAuth and sessions', () => {
     expect(challenge).toBe(result.location.searchParams.get('code_challenge'));
     const stored = await env.DB.prepare('SELECT * FROM admin_sessions').first<Record<string, unknown>>();
     expect(stored?.github_user_id).toBe('123');
+    expect(stored?.github_login).toBe('approved-user');
     expect(stored?.session_hash).not.toBe(result.session.split('=')[1]);
     expect(Number(stored?.expires_at) - Number(stored?.created_at)).toBe(86400000);
+    expect(stored?.last_used_at).toBe(stored?.created_at);
     const replay = await invoke(`/auth/github/callback?state=${result.location.searchParams.get('state')}&code=again`, {
       headers: { Cookie: result.tx }
     });
@@ -100,7 +102,7 @@ describe('OAuth and sessions', () => {
     vi.mocked(fetch).mockImplementation(async (url) =>
       url === 'https://github.com/login/oauth/access_token'
         ? Response.json({ access_token: 'dummy-oauth-token' })
-        : Response.json({ id: 999 })
+        : Response.json({ id: 999, login: 'not-allowed' })
     );
     const rejected = await login();
     expect(rejected.callback.status).toBe(403);
@@ -108,7 +110,7 @@ describe('OAuth and sessions', () => {
     vi.mocked(fetch).mockImplementation(async (url) =>
       url === 'https://github.com/login/oauth/access_token'
         ? Response.json({ access_token: 'dummy-oauth-token' })
-        : new Response('{"id":9007199254740993}', { headers: { 'Content-Type': 'application/json' } })
+        : new Response('{"id":9007199254740993,"login":"unsafe"}', { headers: { 'Content-Type': 'application/json' } })
     );
     expect((await login()).callback.status).toBe(502);
     expect((await env.DB.prepare('SELECT COUNT(*) AS count FROM admin_sessions').first<{ count: number }>())?.count).toBe(0);
@@ -158,14 +160,61 @@ describe('OAuth and sessions', () => {
     expect((await invoke('/api/me', { headers: { Cookie: first.session } })).status).toBe(401);
     expect((await invoke('/api/me', { headers: { Cookie: getCookie(next, '__Host-admin_session') } })).status).toBe(200);
   });
+
+  it('returns only server-verified identity and role and updates last use without sliding expiry', async () => {
+    const { session } = await login();
+    const before = await env.DB.prepare('SELECT expires_at FROM admin_sessions').first<{ expires_at: number }>();
+    await env.DB.prepare('UPDATE admin_sessions SET last_used_at = 0').run();
+    const response = await invoke('/api/me', { headers: { Cookie: session } });
+    const body = await response.json() as {
+      authenticated: boolean;
+      user: { githubId: string; githubLogin: string; role: string };
+      csrfToken: string;
+    };
+    expect(body).toMatchObject({
+      authenticated: true,
+      user: { githubId: '123', githubLogin: 'approved-user', role: 'ADMIN' }
+    });
+    expect(body.csrfToken).toBeTruthy();
+    expect(JSON.stringify(body)).not.toContain('dummy-oauth-token');
+    expect(JSON.stringify(body)).not.toContain(session.split('=')[1]);
+    const after = await env.DB.prepare('SELECT expires_at, last_used_at FROM admin_sessions').first<{
+      expires_at: number;
+      last_used_at: number;
+    }>();
+    expect(after?.last_used_at).toBeGreaterThan(0);
+    expect(after?.expires_at).toBe(before?.expires_at);
+  });
+
+  it('rejects malformed or missing GitHub login values', async () => {
+    vi.mocked(fetch).mockImplementation(async (url) =>
+      url === 'https://github.com/login/oauth/access_token'
+        ? Response.json({ access_token: 'dummy-oauth-token' })
+        : Response.json({ id: 123, login: 'not a github login' })
+    );
+    const result = await login();
+    expect(result.callback.status).toBe(502);
+    expect(result.session).toBe('');
+    expect((await env.DB.prepare('SELECT COUNT(*) AS count FROM admin_sessions').first<{ count: number }>())?.count).toBe(0);
+  });
+
+  it('requires reauthentication for legacy sessions without a verified GitHub login', async () => {
+    const { session } = await login();
+    await env.DB.prepare("UPDATE admin_sessions SET github_login = ''").run();
+    expect((await invoke('/api/me', { headers: { Cookie: session } })).status).toBe(401);
+  });
 });
 
 describe('authorization, CSRF, CORS and failure behavior', () => {
   it('distinguishes missing, revoked, expired and removed identities', async () => {
     expect((await invoke('/api/me')).status).toBe(401);
     expect((await invoke('/api/admin/articles')).status).toBe(401);
+    expect((await invoke('/api/admin')).status).toBe(401);
+    expect((await invoke('/api/admin/')).status).toBe(401);
     const { session } = await login();
     expect((await invoke('/api/admin/articles', { headers: { Cookie: session } })).status).toBe(404);
+    expect((await invoke('/api/admin', { headers: { Cookie: session } })).status).toBe(404);
+    expect((await invoke('/api/admin/', { headers: { Cookie: session } })).status).toBe(404);
     expect((await invoke('/api/me', { headers: { Cookie: session } }, { ADMIN_GITHUB_IDS: '999' })).status).toBe(403);
     expect((await invoke('/api/admin/articles', { headers: { Cookie: session } }, { ADMIN_GITHUB_IDS: '999' })).status).toBe(403);
     await env.DB.prepare('UPDATE admin_sessions SET expires_at = 0').run();
