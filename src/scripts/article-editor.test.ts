@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { mountArticleEditor } from './article-editor';
 import { mountArticleEditorUi } from './article-editor-ui';
 import { renderSafeMarkdown } from './editor-preview';
-import type { AdminSession, ArticleSeed } from './article-editor-types';
+import type { AdminSession, ArticleDraft, EditorSeed } from './article-editor-types';
 
 vi.mock('codemirror', () => {
   class UnavailableEditorView {
@@ -14,7 +14,11 @@ vi.mock('codemirror', () => {
   return { basicSetup: [], EditorView: UnavailableEditorView };
 });
 
-const seed: ArticleSeed = {
+const seed: EditorSeed = {
+  id: 'a_1234567890123456789012',
+  articleId: 'a_1234567890123456789012',
+  articlePath: 'src/content/articles/example.mdx',
+  sha: 'a'.repeat(40),
   permalink: '2026/01/01/example',
   sourceFormat: 'mdx',
   title: 'Original title',
@@ -44,7 +48,7 @@ describe('editor authorization bootstrap', () => {
   it('does not load editor controls for a guest', async () => {
     const root = createRoot();
     root.dataset.apiOrigin = 'https://api.example.test';
-    root.dataset.articleSeed = JSON.stringify(seed);
+    root.dataset.articleLocator = JSON.stringify({ articleId: seed.articleId, permalink: seed.permalink });
     const loadEditor = vi.fn();
     await mountArticleEditor(root, {
       fetcher: vi.fn(async () => Response.json({ authenticated: false }, { status: 401 })),
@@ -57,14 +61,16 @@ describe('editor authorization bootstrap', () => {
   it('loads the editor only for the server-derived ADMIN role', async () => {
     const root = createRoot();
     root.dataset.apiOrigin = 'https://api.example.test';
-    root.dataset.articleSeed = JSON.stringify(seed);
+    root.dataset.articleLocator = JSON.stringify({ articleId: seed.articleId, permalink: seed.permalink });
     const mountArticleEditorUi = vi.fn();
     await mountArticleEditor(root, {
-      fetcher: vi.fn(async () => Response.json({
-        authenticated: true,
-        user: { githubId: '123', githubLogin: 'approved-user', role: 'ADMIN' },
-        csrfToken: 'test-csrf-token'
-      })),
+      fetcher: vi.fn()
+        .mockResolvedValueOnce(Response.json({
+          authenticated: true,
+          user: { githubId: '123', githubLogin: 'approved-user', role: 'ADMIN' },
+          csrfToken: 'test-csrf-token'
+        }))
+        .mockResolvedValueOnce(Response.json({ article: { ...seed, articleId: seed.id }, draft: null })),
       loadEditor: async () => ({ mountArticleEditorUi })
     });
     expect(mountArticleEditorUi).toHaveBeenCalledWith(
@@ -72,7 +78,8 @@ describe('editor authorization bootstrap', () => {
       'https://api.example.test',
       seed,
       expect.objectContaining({ user: expect.objectContaining({ role: 'ADMIN' }) }),
-      expect.any(Function)
+      expect.any(Function),
+      null
     );
   });
 });
@@ -150,10 +157,16 @@ describe('in-page article editor', () => {
     const root = createRoot();
     let savedPayload: Record<string, unknown> | null = null;
     const fetcher = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
-      if (init?.method !== 'PUT') return new Response(null, { status: 404 });
+      if (init?.method !== 'POST') return new Response(null, { status: 404 });
       savedPayload = JSON.parse(String(init.body)) as Record<string, unknown>;
       return Response.json({
         draft: {
+          id: 'd_12345678-1234-4234-8234-123456789abc',
+          articlePath: seed.articlePath,
+          baseSha: seed.sha,
+          status: 'DRAFT',
+          createdBy: '123',
+          updatedBy: '123',
           ...savedPayload,
           revision: 1,
           createdAt: 100,
@@ -181,9 +194,10 @@ describe('in-page article editor', () => {
     root.querySelector<HTMLButtonElement>('[data-save]')!.click();
     await vi.waitFor(() => expect(savedPayload).not.toBeNull());
     await vi.waitFor(() => expect(root.querySelector('[data-editor-status]')?.textContent)
-      .toBe('Draft saved locally. It has not been published.'));
+      .toContain('Draft saved locally at'));
 
     expect(savedPayload).toMatchObject({
+      articleId: seed.articleId,
       permalink: seed.permalink,
       expectedRevision: null,
       title: 'Saved title',
@@ -194,23 +208,120 @@ describe('in-page article editor', () => {
       coverUrl: 'https://images.example.test/cover.png',
       body: seed.body
     });
-    expect(fetcher.mock.calls[1]?.[1]).toMatchObject({
-      method: 'PUT',
+    expect(fetcher.mock.calls[0]?.[1]).toMatchObject({
+      method: 'POST',
       credentials: 'include',
       headers: expect.objectContaining({ 'X-CSRF-Token': session.csrfToken })
     });
     expect(root.querySelector('[data-save]')?.hasAttribute('disabled')).toBe(true);
   });
 
+  it('creates new drafts with an editable generated permalink, then keeps it fixed', async () => {
+    const root = createRoot();
+    const newSeed: EditorSeed = {
+      ...seed,
+      id: '',
+      articleId: null,
+      articlePath: '',
+      sha: '',
+      permalink: '2026/01/01/new-article',
+      title: 'New article',
+      description: '',
+      body: ''
+    };
+    let payload: Record<string, unknown> | null = null;
+    const fetcher = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      payload = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return Response.json({
+        draft: {
+          ...payload,
+          id: 'd_12345678-1234-4234-8234-123456789abc',
+          articlePath: 'src/content/articles/chosen-title.mdx',
+          baseSha: null,
+          status: 'DRAFT',
+          revision: 1,
+          createdAt: 100,
+          updatedAt: 100
+        }
+      });
+    });
+    await mountArticleEditorUi(root, 'https://api.example.test', newSeed, session, fetcher);
+    root.querySelector<HTMLButtonElement>('[data-editor-toggle]')!.click();
+    const title = root.querySelector<HTMLInputElement>('[data-field="title"]')!;
+    const permalink = root.querySelector<HTMLInputElement>('[data-permalink-input]')!;
+    title.value = 'Chosen title';
+    title.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(permalink.value).toBe('2026/01/01/chosen-title');
+    permalink.value = '2026/01/02/custom-slug';
+    permalink.dispatchEvent(new Event('input', { bubbles: true }));
+    title.value = 'Changed title';
+    title.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(permalink.value).toBe('2026/01/02/custom-slug');
+
+    root.querySelector<HTMLTextAreaElement>('[data-field="description"]')!.value = 'New article description';
+    root.querySelector<HTMLTextAreaElement>('[data-field="description"]')!.dispatchEvent(new Event('input', { bubbles: true }));
+    root.querySelector<HTMLButtonElement>('[data-save]')!.click();
+    await vi.waitFor(() => expect(payload).not.toBeNull());
+    await vi.waitFor(() => expect(root.querySelector<HTMLInputElement>('[data-permalink-input]')?.disabled).toBe(true));
+    expect(payload).toMatchObject({
+      articleId: null,
+      permalink: '2026/01/02/custom-slug',
+      expectedRevision: null
+    });
+    expect(root.querySelector<HTMLInputElement>('[data-permalink-input]')?.disabled).toBe(true);
+    expect(fetcher.mock.calls[0]?.[0]).toBe('https://api.example.test/api/admin/drafts');
+  });
+
+  it('updates an existing draft by opaque ID and sends its expected revision', async () => {
+    const root = createRoot();
+    const draft: ArticleDraft = {
+      id: 'd_12345678-1234-4234-8234-123456789abc',
+      articlePath: seed.articlePath,
+      baseSha: seed.sha,
+      status: 'DRAFT',
+      permalink: seed.permalink,
+      sourceFormat: seed.sourceFormat,
+      title: seed.title,
+      description: seed.description,
+      publishedAt: seed.publishedAt,
+      categories: seed.categories,
+      tags: seed.tags,
+      coverUrl: null,
+      body: seed.body,
+      revision: 4,
+      createdAt: 100,
+      updatedAt: 200
+    };
+    const fetcher = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const saved = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return Response.json({ draft: { ...draft, ...saved, revision: 5, updatedAt: 300 } });
+    });
+    await mountArticleEditorUi(root, 'https://api.example.test', seed, session, fetcher, draft);
+    const title = root.querySelector<HTMLInputElement>('[data-field="title"]')!;
+    title.value = 'Updated draft title';
+    title.dispatchEvent(new Event('input', { bubbles: true }));
+    root.querySelector<HTMLButtonElement>('[data-save]')!.click();
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+    expect(fetcher.mock.calls[0]?.[0]).toBe(
+      'https://api.example.test/api/admin/drafts/d_12345678-1234-4234-8234-123456789abc'
+    );
+    expect(fetcher.mock.calls[0]?.[1]).toMatchObject({ method: 'PUT' });
+    expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toMatchObject({
+      articleId: null,
+      expectedRevision: 4,
+      title: 'Updated draft title'
+    });
+  });
+
   it('keeps edits and reports a clear error when the draft API fails', async () => {
     const root = createRoot();
     const fetcher = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) =>
-      init?.method === 'PUT'
+      init?.method === 'POST'
         ? Response.json({ error: 'service_unavailable' }, { status: 503 })
         : Response.json({ error: 'service_unavailable' }, { status: 503 })
     );
     await mountArticleEditorUi(root, 'https://api.example.test', seed, session, fetcher);
-    expect(root.querySelector('[data-editor-status]')?.textContent).toContain('Could not load the saved draft');
+    expect(root.querySelector('[data-editor-status]')?.textContent).toBe('No unsaved changes.');
 
     root.querySelector<HTMLButtonElement>('[data-editor-toggle]')!.click();
     const title = root.querySelector<HTMLInputElement>('[data-field="title"]')!;

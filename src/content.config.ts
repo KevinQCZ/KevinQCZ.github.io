@@ -1,24 +1,14 @@
 import { defineCollection } from 'astro:content';
 import { glob } from 'astro/loaders';
 import { z } from 'astro/zod';
+import { articleMetadataSchema } from './lib/article-schema';
 
 const articles = defineCollection({
   loader: glob({
     pattern: '**/*.{md,mdx}',
     base: './src/content/articles'
   }),
-  schema: z.object({
-    title: z.string(),
-    description: z.string(),
-    publishedAt: z.coerce.date(),
-    permalink: z.string().regex(/^\d{4}\/\d{2}\/\d{2}\/[^/]+$/),
-    categories: z.array(z.string()).default([]),
-    tags: z.array(z.string()).default([]),
-    cover: z.url().refine((value) => {
-      const url = new URL(value);
-      return url.protocol === 'https:' && !url.username && !url.password;
-    }, 'Cover images must use an HTTPS URL without embedded credentials.').optional()
-  })
+  schema: articleMetadataSchema
 });
 
 const projects = defineCollection({

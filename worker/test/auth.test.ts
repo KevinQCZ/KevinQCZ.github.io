@@ -213,7 +213,7 @@ describe('authorization, CSRF, CORS and failure behavior', () => {
     expect((await invoke('/api/admin')).status).toBe(401);
     expect((await invoke('/api/admin/')).status).toBe(401);
     const { session } = await login();
-    expect((await invoke('/api/admin/articles', { headers: { Cookie: session } })).status).toBe(404);
+    expect((await invoke('/api/admin/articles', { headers: { Cookie: session } })).status).toBe(200);
     expect((await invoke('/api/admin', { headers: { Cookie: session } })).status).toBe(404);
     expect((await invoke('/api/admin/', { headers: { Cookie: session } })).status).toBe(404);
     expect((await invoke('/api/me', { headers: { Cookie: session } }, { ADMIN_GITHUB_IDS: '999' })).status).toBe(403);
@@ -330,6 +330,12 @@ describe('authorization, CSRF, CORS and failure behavior', () => {
     const stored = await env.DB.prepare('SELECT title, body FROM article_drafts WHERE permalink = ?')
       .bind(payload.permalink).first<{ title: string; body: string }>();
     expect(stored).toEqual({ title: 'Updated draft', body: '# Draft source' });
+    const audit = await env.DB.prepare(
+      "SELECT action FROM audit_logs WHERE resource_type = 'draft' ORDER BY action"
+    ).all<{ action: string }>();
+    expect(audit.results.map(({ action }) => action)).toEqual([
+      'draft.create', 'draft.preview', 'draft.update'
+    ]);
   });
 
   it('rejects unsafe draft fields, invalid origins and oversized requests', async () => {
