@@ -1,5 +1,6 @@
 import type { EditorView } from 'codemirror';
 import { isSafeCoverUrl, renderSafeMarkdown } from './editor-preview';
+import { adminFetch } from './admin-auth';
 import type { AdminSession, ArticleContent, ArticleDraft, EditorSeed, DraftPayload } from './article-editor-types';
 import '../styles/article-editor.css';
 
@@ -11,7 +12,7 @@ function isArticleDraft(value: unknown, permalink: string): value is ArticleDraf
   return typeof draft.id === 'string' && /^d_[a-f0-9-]{32,36}$/i.test(draft.id) &&
     (draft.articlePath === null || typeof draft.articlePath === 'string') &&
     (draft.baseSha === null || typeof draft.baseSha === 'string') &&
-    draft.status === 'DRAFT' && draft.permalink === permalink &&
+    ['DRAFT', 'PENDING_PUBLICATION'].includes(String(draft.status)) && draft.permalink === permalink &&
     ['md', 'mdx'].includes(String(draft.sourceFormat)) &&
     typeof draft.title === 'string' && typeof draft.description === 'string' &&
     typeof draft.publishedAt === 'string' && Array.isArray(draft.categories) &&
@@ -19,7 +20,23 @@ function isArticleDraft(value: unknown, permalink: string): value is ArticleDraf
     Array.isArray(draft.tags) && draft.tags.every((item) => typeof item === 'string') &&
     (draft.coverUrl === null || typeof draft.coverUrl === 'string') &&
     typeof draft.body === 'string' && Number.isSafeInteger(draft.revision) &&
-    typeof draft.createdAt === 'number' && typeof draft.updatedAt === 'number';
+    typeof draft.createdAt === 'number' && typeof draft.updatedAt === 'number' &&
+    ['NOT_SUBMITTED', 'OPEN', 'CLOSED', 'MERGED'].includes(String(draft.publicationState)) &&
+    (draft.pullRequestNumber === null || Number.isSafeInteger(draft.pullRequestNumber)) &&
+    (draft.pullRequestUrl === null || typeof draft.pullRequestUrl === 'string') &&
+    (draft.submittedRevision === null || Number.isSafeInteger(draft.submittedRevision));
+}
+
+function safePullRequestUrl(value: unknown, number: number): value is string {
+  if (typeof value !== 'string') return false;
+  try {
+    const url = new URL(value);
+    return url.origin === 'https://github.com' &&
+      url.pathname === `/KevinQCZ/KevinQCZ.github.io/pull/${number}` &&
+      !url.search && !url.hash && !url.username && !url.password;
+  } catch {
+    return false;
+  }
 }
 
 function contentOf(article: EditorSeed | ArticleDraft): EditorContent {
@@ -66,8 +83,10 @@ function editorMarkup(): string {
           <button type="button" class="button-secondary" data-preview-action>Preview</button>
           <button type="button" class="button-secondary" data-cancel>Cancel</button>
           <button type="button" class="button-primary" data-save disabled>Save Draft</button>
+          <button type="button" class="button-primary" data-publish disabled>Create pull request</button>
         </div>
       </div>
+      <a data-pull-request hidden target="_blank" rel="noopener noreferrer"></a>
       <div class="article-editor-tabs" role="tablist" aria-label="Editor view">
         <button type="button" role="tab" id="editor-tab" aria-controls="editor-tabpanel" aria-selected="true" data-tab="editor">Editor</button>
         <button type="button" role="tab" id="preview-tab" aria-controls="preview-tabpanel" aria-selected="false" data-tab="preview" tabindex="-1">Preview</button>
@@ -128,6 +147,8 @@ export async function mountArticleEditorUi(
   const readMode = root.parentElement?.querySelector<HTMLElement>('[data-article-read-mode]');
   const status = root.querySelector<HTMLElement>('[data-editor-status]')!;
   const saveButton = root.querySelector<HTMLButtonElement>('[data-save]')!;
+  const publishButton = root.querySelector<HTMLButtonElement>('[data-publish]')!;
+  const pullRequestLink = root.querySelector<HTMLAnchorElement>('[data-pull-request]')!;
   const cancelButton = root.querySelector<HTMLButtonElement>('[data-cancel]')!;
   const previewButton = root.querySelector<HTMLButtonElement>('[data-preview-action]')!;
   const sourceHost = root.querySelector<HTMLElement>('[data-code-editor]')!;
@@ -163,6 +184,7 @@ export async function mountArticleEditorUi(
   let editorError = false;
   let dirty = false;
   let saving = false;
+  let publicationState = initialDraft?.publicationState ?? 'NOT_SUBMITTED';
   let activeTab: 'editor' | 'preview' = 'editor';
 
   const setStatus = (message: string, isError = false) => {
@@ -213,12 +235,34 @@ export async function mountArticleEditorUi(
     renderSafeMarkdown(current.body, previewBody, safeCover, current.title);
   };
 
+  const refreshActions = () => {
+    saveButton.disabled = saving || !dirty;
+    publishButton.disabled = saving || dirty || !draftId || revision === null;
+    publishButton.textContent = publicationState === 'OPEN' || publicationState === 'CLOSED'
+      ? 'Update pull request'
+      : 'Create pull request';
+  };
+
   const refreshDirty = () => {
     dirty = !sameContent(currentContent(), baseline);
-    saveButton.disabled = saving || !dirty;
+    refreshActions();
     if (dirty) setStatus('Unsaved changes.');
     else if (!saving) setStatus('No unsaved changes.');
     updatePreview();
+  };
+
+  const updatePublication = (draft: ArticleDraft) => {
+    publicationState = draft.publicationState;
+    refreshDirty();
+    if (draft.pullRequestNumber && safePullRequestUrl(draft.pullRequestUrl, draft.pullRequestNumber)) {
+      pullRequestLink.href = draft.pullRequestUrl;
+      pullRequestLink.textContent = `View pull request #${draft.pullRequestNumber}`;
+      pullRequestLink.hidden = false;
+    } else {
+      pullRequestLink.removeAttribute('href');
+      pullRequestLink.textContent = '';
+      pullRequestLink.hidden = true;
+    }
   };
 
   const fill = (content: EditorContent) => {
@@ -409,16 +453,18 @@ export async function mountArticleEditorUi(
     saveButton.disabled = true;
     setStatus('Saving draft…');
     try {
-      const response = await fetcher(
+      const response = await adminFetch(
+        apiOrigin,
         draftId
-          ? `${apiOrigin}/api/admin/drafts/${encodeURIComponent(draftId)}`
-          : `${apiOrigin}/api/admin/drafts`,
+          ? `/api/admin/drafts/${encodeURIComponent(draftId)}`
+          : '/api/admin/drafts',
         {
         method: draftId ? 'PUT' : 'POST',
-        credentials: 'include',
         headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': session.csrfToken },
         body: JSON.stringify(payload)
-        }
+        },
+        fetcher,
+        session
       );
       if (response.status === 409) {
         setStatus('A newer draft exists. Your edits are still here; copy them before reloading the saved draft.', true);
@@ -433,6 +479,7 @@ export async function mountArticleEditorUi(
       baseline = contentOf(result.draft);
       revision = result.draft.revision;
       draftId = result.draft.id;
+      updatePublication(result.draft);
       permalinkInput.disabled = true;
       permalinkInput.hidden = true;
       permalinkLabel.hidden = true;
@@ -446,7 +493,63 @@ export async function mountArticleEditorUi(
       setStatus('Draft could not be saved. Your edits are still here.', true);
     } finally {
       saving = false;
-      saveButton.disabled = !dirty;
+      refreshActions();
+    }
+  });
+
+  publishButton.addEventListener('click', async () => {
+    if (!draftId || revision === null || dirty || saving) return;
+    saving = true;
+    refreshDirty();
+    setStatus('Creating pull request…');
+    try {
+      const response = await adminFetch(
+        apiOrigin,
+        `/api/admin/drafts/${encodeURIComponent(draftId)}/publish`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': session.csrfToken },
+          body: JSON.stringify({ expectedRevision: revision })
+        },
+        fetcher,
+        session
+      );
+      if (response.status === 409) {
+        const conflict = await response.json().catch(() => null) as { error?: unknown } | null;
+        const message = conflict?.error === 'base_conflict'
+          ? 'The published article changed since this draft was started. Reload its current source before creating a pull request.'
+          : conflict?.error === 'article_conflict'
+            ? 'Another published article uses this path or permalink.'
+            : conflict?.error === 'revision_conflict'
+              ? 'The draft changed during publication. Refresh the draft list and review the latest revision.'
+              : conflict?.error === 'publication_in_progress'
+                ? 'A publication request is already in progress.'
+                : conflict?.error === 'already_published'
+                  ? 'This pull request has already been merged. Refresh the article before editing again.'
+                  : 'The draft could not be published because of a conflict.';
+        setStatus(message, true);
+        return;
+      }
+      if (!response.ok) throw new Error('Pull request creation failed');
+      const result: unknown = await response.json();
+      if (!result || typeof result !== 'object' ||
+          !('draft' in result) || !isArticleDraft(result.draft, currentContent().permalink) ||
+          !('pullRequest' in result) || !result.pullRequest || typeof result.pullRequest !== 'object') {
+        throw new Error('Invalid pull request response');
+      }
+      const pullRequest = result.pullRequest as { number?: unknown; url?: unknown; state?: unknown };
+      if (!Number.isSafeInteger(pullRequest.number) || !safePullRequestUrl(pullRequest.url, pullRequest.number as number) ||
+          pullRequest.state !== 'OPEN') throw new Error('Invalid pull request response');
+      revision = result.draft.revision;
+      baseline = contentOf(result.draft);
+      updatePublication(result.draft);
+      setStatus(`Pull request #${pullRequest.number} is ready for review. Merge it to publish; this action does not merge it.`);
+      callbacks.onSaved?.(result.draft);
+    } catch {
+      setStatus('The pull request could not be created. Your private draft remains saved.', true);
+    } finally {
+      saving = false;
+      refreshActions();
     }
   });
 
@@ -455,6 +558,7 @@ export async function mountArticleEditorUi(
     permalinkInput.hidden = true;
     permalinkLabel.hidden = true;
     permalinkFixed.hidden = false;
+    updatePublication(initialDraft);
   }
   setTab('editor');
 }

@@ -1,4 +1,12 @@
 import { mountArticleEditorUi } from './article-editor-ui';
+import {
+  AdminAuthError,
+  adminFetch,
+  authErrorMessage,
+  clearAdminSession,
+  githubLoginUrl,
+  initializeAdminSession
+} from './admin-auth';
 import type {
   AdminSession,
   ArticleDraft,
@@ -24,7 +32,8 @@ interface ArticleDetailResponse {
 function isAdminSession(value: unknown): value is AdminSession {
   if (!value || typeof value !== 'object') return false;
   const response = value as Partial<AdminSession>;
-  return typeof response.csrfToken === 'string' && response.csrfToken.length > 0 &&
+  return typeof response.accessToken === 'string' && response.accessToken.length > 0 &&
+    typeof response.csrfToken === 'string' && response.csrfToken.length > 0 &&
     typeof response.user?.githubId === 'string' &&
     typeof response.user.githubLogin === 'string' && response.user.githubLogin.length > 0 &&
     response.user.role === 'ADMIN';
@@ -42,6 +51,18 @@ function apiOrigin(value: string | undefined): string | null {
   }
 }
 
+function validPullRequestUrl(value: unknown, number: unknown): value is string {
+  if (typeof value !== 'string' || !Number.isSafeInteger(number)) return false;
+  try {
+    const url = new URL(value);
+    return url.origin === 'https://github.com' &&
+      url.pathname === `/KevinQCZ/KevinQCZ.github.io/pull/${number}` &&
+      !url.search && !url.hash && !url.username && !url.password;
+  } catch {
+    return false;
+  }
+}
+
 function isArticleList(value: unknown): value is ArticleListResponse {
   if (!value || typeof value !== 'object') return false;
   const result = value as Partial<ArticleListResponse>;
@@ -55,7 +76,11 @@ function isArticleList(value: unknown): value is ArticleListResponse {
     Array.isArray(result.drafts) &&
     result.drafts.every((draft) => typeof draft.id === 'string' &&
       typeof draft.permalink === 'string' && typeof draft.title === 'string' &&
-      typeof draft.updatedAt === 'number' && draft.status === 'DRAFT');
+      typeof draft.updatedAt === 'number' &&
+      ['DRAFT', 'PENDING_PUBLICATION'].includes(String(draft.status)) &&
+      ['NOT_SUBMITTED', 'OPEN', 'CLOSED', 'MERGED'].includes(String(draft.publicationState)) &&
+      (draft.pullRequestUrl === null && draft.pullRequestNumber === null ||
+        validPullRequestUrl(draft.pullRequestUrl, draft.pullRequestNumber)));
 }
 
 function isArticleSeed(value: unknown): value is ArticleSeed {
@@ -74,12 +99,15 @@ function isArticleDraft(value: unknown): value is ArticleDraft {
   if (!value || typeof value !== 'object') return false;
   const draft = value as Partial<ArticleDraft>;
   return typeof draft.id === 'string' && /^d_[a-f0-9-]{32,36}$/i.test(draft.id) &&
-    draft.status === 'DRAFT' && typeof draft.permalink === 'string' &&
+    ['DRAFT', 'PENDING_PUBLICATION'].includes(String(draft.status)) && typeof draft.permalink === 'string' &&
     ['md', 'mdx'].includes(String(draft.sourceFormat)) &&
     typeof draft.title === 'string' && typeof draft.description === 'string' &&
     typeof draft.publishedAt === 'string' && Array.isArray(draft.categories) &&
     Array.isArray(draft.tags) && typeof draft.body === 'string' &&
-    Number.isSafeInteger(draft.revision) && typeof draft.updatedAt === 'number';
+    Number.isSafeInteger(draft.revision) && typeof draft.updatedAt === 'number' &&
+    ['NOT_SUBMITTED', 'OPEN', 'CLOSED', 'MERGED'].includes(String(draft.publicationState)) &&
+    (draft.pullRequestUrl === null && draft.pullRequestNumber === null ||
+      validPullRequestUrl(draft.pullRequestUrl, draft.pullRequestNumber));
 }
 
 function seedFromDraft(draft: ArticleDraft): EditorSeed {
@@ -152,7 +180,7 @@ export async function initAdminDashboard(
     return;
   }
 
-  login.addEventListener('click', () => navigate(`${api}/auth/github`));
+  login.addEventListener('click', () => navigate(githubLoginUrl(api, '/admin/')));
 
   const closeEditor = () => {
     activeDraftId = null;
@@ -160,8 +188,8 @@ export async function initAdminDashboard(
     editorMount.replaceChildren();
   };
 
-  const request = async (path: string, init?: RequestInit) =>
-    fetcher(`${api}${path}`, { credentials: 'include', ...init });
+  const request = (path: string, init?: RequestInit) =>
+    adminFetch(api, path, init, fetcher, session);
 
   const renderList = () => {
     articleList.replaceChildren();
@@ -181,7 +209,18 @@ export async function initAdminDashboard(
     for (const draft of drafts) {
       const item = document.createElement('li');
       const label = document.createElement('span');
-      label.textContent = `${draft.title} — /${draft.permalink}/`;
+      label.textContent = `${draft.title} — /${draft.permalink}/ — ${draft.publicationState.replace('_', ' ').toLowerCase()}`;
+      if (draft.pullRequestUrl && draft.pullRequestNumber &&
+          validPullRequestUrl(draft.pullRequestUrl, draft.pullRequestNumber)) {
+        const pullRequest = document.createElement('a');
+        pullRequest.href = draft.pullRequestUrl;
+        pullRequest.target = '_blank';
+        pullRequest.rel = 'noopener noreferrer';
+        pullRequest.textContent = `PR #${draft.pullRequestNumber}`;
+        item.append(label, pullRequest);
+      } else {
+        item.append(label);
+      }
       const updated = document.createElement('time');
       updated.dateTime = new Date(draft.updatedAt).toISOString();
       updated.textContent = `Saved ${new Date(draft.updatedAt).toLocaleString()}`;
@@ -195,7 +234,8 @@ export async function initAdminDashboard(
       deleteButton.className = 'button-secondary';
       deleteButton.dataset.deleteDraft = draft.id;
       deleteButton.textContent = 'Delete draft';
-      item.append(label, updated, continueButton, deleteButton);
+      item.append(updated, continueButton);
+      if (draft.status === 'DRAFT') item.append(deleteButton);
       draftList.append(item);
     }
   };
@@ -205,6 +245,7 @@ export async function initAdminDashboard(
     try {
       const response = await request('/api/admin/articles');
       if (response.status === 401 || response.status === 403) {
+        clearAdminSession(api);
         session = null;
         tools.hidden = true;
         closeEditor();
@@ -332,6 +373,7 @@ export async function initAdminDashboard(
       });
       if (!response.ok) throw new Error('Sign-out failed');
       session = null;
+      clearAdminSession(api);
       tools.hidden = true;
       closeEditor();
       articles = [];
@@ -347,24 +389,19 @@ export async function initAdminDashboard(
 
   show('Checking sign-in status…');
   try {
-    const response = await request('/api/me');
-    if (response.status === 401) {
+    session = await initializeAdminSession(api, fetcher);
+    if (!session) {
       show('Not signed in.', true);
       return;
     }
-    if (response.status === 403) {
-      show('This account is not authorized.');
-      return;
-    }
-    if (!response.ok) throw new Error('Session check failed');
-    const result: unknown = await response.json();
-    if (!isAdminSession(result)) throw new Error('Invalid session response');
-    session = result;
+    if (!isAdminSession(session)) throw new Error('Invalid session response');
     tools.hidden = false;
     createButton.hidden = false;
     show(`Signed in as ${session.user.githubLogin} (ADMIN).`, false, true);
     await refreshList();
-  } catch {
-    show('The administrator service is unavailable.');
+  } catch (cause) {
+    show(cause instanceof AdminAuthError
+      ? authErrorMessage(cause.code)
+      : 'The administrator service is unavailable.', true);
   }
 }

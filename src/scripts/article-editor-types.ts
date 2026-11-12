@@ -32,10 +32,14 @@ export interface ArticleDraft extends ArticleContent {
   id: string;
   articlePath: string | null;
   baseSha: string | null;
-  status: 'DRAFT';
+  status: 'DRAFT' | 'PENDING_PUBLICATION' | 'PUBLISHED' | 'UNPUBLISHED';
   revision: number;
   createdAt: number;
   updatedAt: number;
+  publicationState: 'NOT_SUBMITTED' | 'OPEN' | 'CLOSED' | 'MERGED';
+  pullRequestNumber: number | null;
+  pullRequestUrl: string | null;
+  submittedRevision: number | null;
 }
 
 export interface DraftPayload extends ArticleContent {
@@ -58,6 +62,7 @@ export interface AdminArticleDetail {
 }
 
 export interface AdminSession {
+  accessToken: string;
   csrfToken: string;
   user: {
     githubId: string;

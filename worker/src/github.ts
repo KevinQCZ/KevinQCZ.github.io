@@ -1,5 +1,5 @@
 import { articleMetadataSchema } from '../../src/lib/article-schema';
-import { parse as parseYaml } from 'yaml';
+import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 
 const REPOSITORY = 'KevinQCZ/KevinQCZ.github.io';
 const BRANCH = 'master';
@@ -34,7 +34,34 @@ export interface PublishedArticle extends PublishedArticleFile {
   body: string;
 }
 
-export class GitHubSourceError extends Error {}
+export interface ArticlePublicationInput {
+  draftId: string;
+  revision: number;
+  articlePath: string;
+  sourceFormat: 'md' | 'mdx';
+  baseSha: string | null;
+  title: string;
+  description: string;
+  publishedAt: string;
+  permalink: string;
+  categories: string[];
+  tags: string[];
+  coverUrl: string | null;
+  body: string;
+}
+
+export interface PullRequestResult {
+  number: number;
+  url: string;
+  state: 'OPEN' | 'CLOSED' | 'MERGED';
+  mergeCommitSha: string | null;
+}
+
+export class GitHubSourceError extends Error {
+  constructor(message: string, readonly status?: number, readonly code?: string) {
+    super(message);
+  }
+}
 
 function base64Url(bytes: Uint8Array): string {
   let binary = '';
@@ -112,7 +139,11 @@ async function appJwt(config: GitHubAppConfig): Promise<string> {
 }
 
 async function responseJson(response: Response): Promise<unknown> {
-  if (!response.ok || !response.body) throw new GitHubSourceError('GitHub request failed');
+  if (!response.ok) {
+    await response.body?.cancel();
+    throw new GitHubSourceError('GitHub request failed', response.status);
+  }
+  if (!response.body) throw new GitHubSourceError('GitHub response is empty');
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
   let size = 0;
@@ -169,10 +200,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 async function githubJson(
   token: string,
   path: string,
-  fetcher: typeof fetch
+  fetcher: typeof fetch,
+  init: RequestInit = {}
 ): Promise<unknown> {
   return responseJson(await fetcher(`${API}${path}`, {
+    ...init,
     headers: {
+      ...Object.fromEntries(new Headers(init.headers).entries()),
       Authorization: `Bearer ${token}`,
       Accept: 'application/vnd.github+json',
       'X-GitHub-Api-Version': '2022-11-28',
@@ -313,6 +347,258 @@ export async function publishedArticleConflicts(
     }
   }
   return { permalinkExists, pathExists };
+}
+
+function articleSource(input: ArticlePublicationInput): string {
+  const metadata = articleMetadataSchema.safeParse({
+    title: input.title,
+    description: input.description,
+    publishedAt: input.publishedAt,
+    permalink: input.permalink,
+    categories: input.categories,
+    tags: input.tags,
+    ...(input.coverUrl ? { cover: input.coverUrl } : {})
+  });
+  if (!metadata.success || !validArticlePath(input.articlePath) ||
+      !input.articlePath.endsWith(`.${input.sourceFormat}`) ||
+      !/^[a-f0-9]{40,64}$/i.test(input.baseSha ?? '') && input.baseSha !== null ||
+      !/^d_[a-f0-9-]{32,36}$/i.test(input.draftId) ||
+      !Number.isSafeInteger(input.revision) || input.revision < 1 ||
+      encoder.encode(input.body).byteLength > 256 * 1024) {
+    throw new GitHubSourceError('Invalid article publication input', 400, 'invalid_draft');
+  }
+  const frontmatter = stringifyYaml({
+    title: input.title,
+    description: input.description,
+    publishedAt: input.publishedAt,
+    permalink: input.permalink,
+    categories: input.categories,
+    tags: input.tags,
+    ...(input.coverUrl ? { cover: input.coverUrl } : {})
+  }).trimEnd();
+  return `---\n${frontmatter}\n---\n${input.body}`;
+}
+
+function base64(bytes: Uint8Array): string {
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+function pullRequestState(value: unknown): PullRequestResult {
+  if (!isRecord(value) || !Number.isSafeInteger(value.number) || typeof value.html_url !== 'string' ||
+      typeof value.state !== 'string' || !isRecord(value.base) || value.base.ref !== BRANCH ||
+      !(value.merged_at === null || typeof value.merged_at === 'string') ||
+      !(value.merge_commit_sha === null || typeof value.merge_commit_sha === 'string')) {
+    throw new GitHubSourceError('Invalid GitHub pull request response');
+  }
+  const merged = value.merged_at !== null;
+  return {
+    number: value.number as number,
+    url: value.html_url,
+    state: merged ? 'MERGED' : value.state === 'open' ? 'OPEN' : 'CLOSED',
+    mergeCommitSha: typeof value.merge_commit_sha === 'string' ? value.merge_commit_sha : null
+  };
+}
+
+async function branchRef(
+  token: string,
+  branch: string,
+  fetcher: typeof fetch
+): Promise<{ sha: string } | null> {
+  try {
+    const ref = await githubJson(
+      token,
+      `/repos/${REPOSITORY}/git/ref/heads/${encodeURIComponent(branch)}`,
+      fetcher
+    );
+    if (!isRecord(ref) || !isRecord(ref.object) || typeof ref.object.sha !== 'string' ||
+        !/^[a-f0-9]{40,64}$/i.test(ref.object.sha)) {
+      throw new GitHubSourceError('Invalid GitHub branch response');
+    }
+    return { sha: ref.object.sha };
+  } catch (cause) {
+    if (cause instanceof GitHubSourceError && cause.status === 404) return null;
+    throw cause;
+  }
+}
+
+async function articleOnBranch(
+  token: string,
+  path: string,
+  branch: string,
+  fetcher: typeof fetch
+): Promise<{ sha: string; source: string } | null> {
+  const encodedPath = path.split('/').map(encodeURIComponent).join('/');
+  try {
+    const file = await githubJson(
+      token,
+      `/repos/${REPOSITORY}/contents/${encodedPath}?ref=${encodeURIComponent(branch)}`,
+      fetcher
+    );
+    if (!isRecord(file) || file.type !== 'file' || typeof file.sha !== 'string') {
+      throw new GitHubSourceError('Invalid GitHub article file response');
+    }
+    return { sha: file.sha, source: await getBlob(token, file.sha, fetcher) };
+  } catch (cause) {
+    if (cause instanceof GitHubSourceError && cause.status === 404) return null;
+    throw cause;
+  }
+}
+
+async function findOpenPullRequest(
+  token: string,
+  branch: string,
+  fetcher: typeof fetch
+): Promise<PullRequestResult | null> {
+  const params = new URLSearchParams({ state: 'open', head: `KevinQCZ:${branch}`, base: BRANCH });
+  const result = await githubJson(
+    token,
+    `/repos/${REPOSITORY}/pulls?${params.toString()}`,
+    fetcher
+  );
+  if (!Array.isArray(result)) throw new GitHubSourceError('Invalid GitHub pull request list');
+  if (!result.length) return null;
+  const pull = pullRequestState(result[0]);
+  if (result.length !== 1) throw new GitHubSourceError('Multiple GitHub pull requests use the publication branch');
+  return pull;
+}
+
+export async function publishArticleDraft(
+  config: GitHubAppConfig,
+  input: ArticlePublicationInput,
+  existingBranch: string | null,
+  existingPullRequest: number | null,
+  fetcher: typeof fetch = fetch
+): Promise<{ branch: string; pullRequest: PullRequestResult; fileSha: string }> {
+  const token = await installationToken(config, fetcher);
+  const files = await treeFiles(token, fetcher);
+  const currentFile = files.find((file) => file.articlePath === input.articlePath);
+  if (input.baseSha) {
+    if (!currentFile || currentFile.sha.toLowerCase() !== input.baseSha.toLowerCase()) {
+      throw new GitHubSourceError('Published article changed since this draft was created', 409, 'base_conflict');
+    }
+  } else if (currentFile) {
+    throw new GitHubSourceError('Article path already exists', 409, 'article_conflict');
+  }
+  for (const file of files) {
+    if (file.articlePath === input.articlePath) continue;
+    if (parsePublishedArticle(file, await getBlob(token, file.sha, fetcher)).permalink === input.permalink) {
+      throw new GitHubSourceError('Article permalink already exists', 409, 'article_conflict');
+    }
+  }
+
+  const branch = existingBranch ?? `blog/draft-${input.draftId.slice(2).replaceAll('-', '')}-r${input.revision}`;
+  if (!/^blog\/draft-[a-f0-9]{32}-r[1-9]\d*$/i.test(branch)) {
+    throw new GitHubSourceError('Invalid publication branch', 400, 'invalid_publication_branch');
+  }
+  const baseRef = await githubJson(
+    token,
+    `/repos/${REPOSITORY}/git/ref/heads/${encodeURIComponent(BRANCH)}`,
+    fetcher
+  );
+  if (!isRecord(baseRef) || !isRecord(baseRef.object) || typeof baseRef.object.sha !== 'string' ||
+      !/^[a-f0-9]{40,64}$/i.test(baseRef.object.sha)) {
+    throw new GitHubSourceError('Invalid GitHub base branch response');
+  }
+
+  const ref = await branchRef(token, branch, fetcher);
+  if (!ref) {
+    await githubJson(token, `/repos/${REPOSITORY}/git/refs`, fetcher, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: baseRef.object.sha })
+    });
+  } else if (!existingBranch) {
+    throw new GitHubSourceError('Publication branch already exists', 409, 'branch_conflict');
+  }
+
+  let pullRequest = existingPullRequest
+    ? await getPullRequest(config, existingPullRequest, fetcher)
+    : await findOpenPullRequest(token, branch, fetcher);
+  if (pullRequest?.state === 'MERGED') {
+    throw new GitHubSourceError('This article pull request was already merged', 409, 'already_published');
+  }
+
+  const oldFile = await articleOnBranch(token, input.articlePath, branch, fetcher);
+  if (input.baseSha && !oldFile) {
+    throw new GitHubSourceError('Article is missing from the publication branch', 409, 'base_conflict');
+  }
+  if (!input.baseSha && oldFile && !existingBranch) {
+    throw new GitHubSourceError('New article already exists on the publication branch', 409, 'branch_conflict');
+  }
+  const source = articleSource(input);
+  let fileSha = oldFile?.sha ?? '';
+  if (oldFile?.source !== source) {
+    const encodedPath = input.articlePath.split('/').map(encodeURIComponent).join('/');
+    const result = await githubJson(
+      token,
+      `/repos/${REPOSITORY}/contents/${encodedPath}`,
+      fetcher,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: `Update article: ${input.title.slice(0, 100)}`,
+          content: base64(encoder.encode(source)),
+          branch,
+          ...(oldFile ? { sha: oldFile.sha } : {})
+        })
+      }
+    );
+    if (!isRecord(result) || !isRecord(result.content) || typeof result.content.sha !== 'string') {
+      throw new GitHubSourceError('Invalid GitHub article write response');
+    }
+    fileSha = result.content.sha;
+  } else if (oldFile) {
+    fileSha = oldFile.sha;
+  }
+
+  if (pullRequest?.state === 'CLOSED') {
+    const reopened = await githubJson(
+      token,
+      `/repos/${REPOSITORY}/pulls/${pullRequest.number}`,
+      fetcher,
+      { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ state: 'open' }) }
+    );
+    pullRequest = pullRequestState(reopened);
+  }
+  if (!pullRequest) {
+    try {
+      const created = await githubJson(token, `/repos/${REPOSITORY}/pulls`, fetcher, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: `Publish article: ${input.title.slice(0, 120)}`,
+          head: branch,
+          base: BRANCH,
+          body: `Review the article source and generated site preview before merging.\n\n<!-- admin-draft:${input.draftId}; revision:${input.revision} -->`
+        })
+      });
+      pullRequest = pullRequestState(created);
+    } catch (cause) {
+      if (!(cause instanceof GitHubSourceError) || cause.status !== 422) throw cause;
+      pullRequest = await findOpenPullRequest(token, branch, fetcher);
+      if (!pullRequest) throw cause;
+    }
+  }
+  if (pullRequest.state !== 'OPEN') {
+    throw new GitHubSourceError('Pull request is not open', 409, 'pull_request_not_open');
+  }
+  return { branch, pullRequest, fileSha };
+}
+
+export async function getPullRequest(
+  config: GitHubAppConfig,
+  number: number,
+  fetcher: typeof fetch = fetch
+): Promise<PullRequestResult> {
+  if (!Number.isSafeInteger(number) || number < 1) {
+    throw new GitHubSourceError('Invalid pull request number', 400, 'invalid_pull_request');
+  }
+  const token = await installationToken(config, fetcher);
+  const value = await githubJson(token, `/repos/${REPOSITORY}/pulls/${number}`, fetcher);
+  return pullRequestState(value);
 }
 
 export { validArticlePath };

@@ -28,10 +28,19 @@ tags:
 ---
 # Published source
 `;
+const baseCommitSha = 'c'.repeat(40);
+const updatedArticleSha = 'd'.repeat(40);
 let privateKey = '';
 let rsaPrivateKey = '';
 let githubEnabled = false;
 let githubRequests: { url: string; method: string }[] = [];
+let currentArticleSha = articleSha;
+let currentArticleSource = articleSource;
+let branch: string | null = null;
+let branchFileSha: string | null = null;
+let branchSource = '';
+let createdPullRequest = false;
+let pullRequestState: 'open' | 'closed' | 'merged' = 'open';
 
 function pem(bytes: Uint8Array, label = 'PRIVATE KEY'): string {
   let binary = '';
@@ -80,9 +89,15 @@ const getCookie = (response: Response, name: string) =>
   response.headers.getSetCookie().find((value) => value.startsWith(`${name}=`))?.split(';')[0] ?? '';
 
 function invoke(path: string, init: RequestInit = {}, overrides: Record<string, unknown> = {}) {
+  const headers = new Headers({ ...ip, ...init.headers });
+  const rawToken = headers.get('Cookie') || '';
+  if (/^[A-Za-z0-9_-]{43}$/.test(rawToken)) {
+    headers.delete('Cookie');
+    headers.set('Authorization', `Bearer ${rawToken}`);
+  }
   return worker.fetch(new Request(`https://api.example.test${path}`, {
     ...init,
-    headers: { ...ip, ...init.headers }
+    headers
   }), { ...bindings(), ...overrides } as typeof env);
 }
 
@@ -94,10 +109,15 @@ async function login() {
     `/auth/github/callback?state=${location.searchParams.get('state')}&code=dummy-code`,
     { headers: { Cookie: tx } }
   );
-  const session = getCookie(callback, '__Host-admin_session');
-  const me = await invoke('/api/me', { headers: { Cookie: session } });
-  const { csrfToken } = await me.json() as { csrfToken: string };
-  return { session, csrfToken };
+  const callbackUrl = new URL(callback.headers.get('Location')!);
+  const code = new URLSearchParams(callbackUrl.hash.slice(1)).get('copilot_auth')!;
+  const exchange = await invoke('/api/auth/exchange', {
+    method: 'POST',
+    headers: { Origin: config.SITE_ORIGIN, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code })
+  });
+  const { token, csrfToken } = await exchange.json() as { token: string; csrfToken: string };
+  return { session: token, csrfToken };
 }
 
 function gitHubAppKeyOverrides() {
@@ -121,12 +141,20 @@ beforeEach(async () => {
   await env.DB.batch([
     env.DB.prepare('DELETE FROM admin_sessions'),
     env.DB.prepare('DELETE FROM oauth_transactions'),
+    env.DB.prepare('DELETE FROM oauth_handoffs'),
     env.DB.prepare('DELETE FROM audit_logs'),
     env.DB.prepare('DELETE FROM article_drafts')
   ]);
   limiter.limit.mockReset().mockResolvedValue({ success: true });
   githubRequests = [];
   githubEnabled = false;
+  currentArticleSha = articleSha;
+  currentArticleSource = articleSource;
+  branch = null;
+  branchFileSha = null;
+  branchSource = '';
+  createdPullRequest = false;
+  pullRequestState = 'open';
   vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
     const url = String(input);
     const method = init?.method ?? 'GET';
@@ -143,14 +171,84 @@ beforeEach(async () => {
       expect(new Headers(init?.headers).get('Authorization')).toMatch(/^Bearer [\w.-]+$/);
       return Response.json({ token: 'test-installation-token' });
     }
-    if (url === 'https://api.github.com/repos/KevinQCZ/KevinQCZ.github.io/git/trees/master?recursive=1') {
+    const repository = 'https://api.github.com/repos/KevinQCZ/KevinQCZ.github.io';
+    if (url === `${repository}/git/trees/master?recursive=1`) {
       return Response.json({
         truncated: false,
-        tree: [{ type: 'blob', mode: '100644', path: articlePath, sha: articleSha }]
+        tree: [{ type: 'blob', mode: '100644', path: articlePath, sha: currentArticleSha }]
       });
     }
-    if (url === `https://api.github.com/repos/KevinQCZ/KevinQCZ.github.io/git/blobs/${articleSha}`) {
-      return Response.json({ sha: articleSha, encoding: 'base64', content: encodedBlob(articleSource) });
+    if (url.startsWith(`${repository}/git/blobs/`)) {
+      const sha = url.slice(`${repository}/git/blobs/`.length);
+      if (sha === currentArticleSha) {
+        return Response.json({ sha, encoding: 'base64', content: encodedBlob(currentArticleSource) });
+      }
+      if (sha === branchFileSha) {
+        return Response.json({ sha, encoding: 'base64', content: encodedBlob(branchSource) });
+      }
+    }
+    const parsedUrl = new URL(url);
+    if (parsedUrl.pathname.startsWith(`${new URL(repository).pathname}/git/ref/heads/`)) {
+      const refName = decodeURIComponent(parsedUrl.pathname.slice(
+        `${new URL(repository).pathname}/git/ref/heads/`.length
+      ));
+      if (refName === 'master') return Response.json({ object: { sha: baseCommitSha } });
+      if (branch && refName === branch) return Response.json({ object: { sha: baseCommitSha } });
+      return Response.json({ message: 'Not Found' }, { status: 404 });
+    }
+    if (parsedUrl.pathname === `${new URL(repository).pathname}/git/refs` && method === 'POST') {
+      const payload = JSON.parse(String(init?.body)) as { ref: string; sha: string };
+      branch = payload.ref.replace(/^refs\/heads\//, '');
+      branchFileSha = currentArticleSha;
+      branchSource = currentArticleSource;
+      return Response.json({ ref: payload.ref, object: { sha: payload.sha } });
+    }
+    if (parsedUrl.pathname === `${new URL(repository).pathname}/contents/${articlePath}`) {
+      if (method === 'GET' && parsedUrl.searchParams.get('ref') === branch) {
+        if (!branchFileSha) return Response.json({ message: 'Not Found' }, { status: 404 });
+        return Response.json({ type: 'file', sha: branchFileSha });
+      }
+      if (method === 'PUT') {
+        const payload = JSON.parse(String(init?.body)) as { content: string; branch: string; sha?: string };
+        expect(payload.branch).toBe(branch);
+        expect(payload.sha).toBe(branchFileSha);
+        branchSource = new TextDecoder().decode(Uint8Array.from(atob(payload.content), (value) => value.charCodeAt(0)));
+        branchFileSha = updatedArticleSha;
+        return Response.json({ content: { sha: branchFileSha }, commit: { sha: 'f'.repeat(40) } });
+      }
+    }
+    if (parsedUrl.pathname === `${new URL(repository).pathname}/pulls` && method === 'GET') {
+      return Response.json(createdPullRequest && pullRequestState === 'open' ? [{
+        number: 42,
+        html_url: 'https://github.com/KevinQCZ/KevinQCZ.github.io/pull/42',
+        state: pullRequestState,
+        merged_at: null,
+        merge_commit_sha: null,
+        base: { ref: 'master' }
+      }] : []);
+    }
+    if (parsedUrl.pathname === `${new URL(repository).pathname}/pulls` && method === 'POST') {
+      createdPullRequest = true;
+      pullRequestState = 'open';
+      return Response.json({
+        number: 42,
+        html_url: 'https://github.com/KevinQCZ/KevinQCZ.github.io/pull/42',
+        state: 'open',
+        merged_at: null,
+        merge_commit_sha: null,
+        base: { ref: 'master' }
+      });
+    }
+    if (parsedUrl.pathname === `${new URL(repository).pathname}/pulls/42`) {
+      if (method === 'PATCH') pullRequestState = 'open';
+      return Response.json({
+        number: 42,
+        html_url: 'https://github.com/KevinQCZ/KevinQCZ.github.io/pull/42',
+        state: pullRequestState === 'merged' ? 'closed' : pullRequestState,
+        merged_at: pullRequestState === 'merged' ? '2026-01-02T00:00:00Z' : null,
+        merge_commit_sha: pullRequestState === 'merged' ? 'f'.repeat(40) : null,
+        base: { ref: 'master' }
+      });
     }
     throw new Error(`Unexpected GitHub URL: ${url}`);
   });
@@ -310,6 +408,147 @@ describe('admin article source and draft management', () => {
       headers: { Cookie: session }
     }, gitHubAppKeyOverrides());
     expect(await stillPublished.json()).toMatchObject({ article: { sha: articleSha, body: article.body }, draft: null });
+  });
+
+  it('publishes only a saved revision to a generated branch and opens or updates a review PR', async () => {
+    const { session, csrfToken } = await login();
+    const id = crypto.randomUUID();
+    await env.DB.prepare(
+      `INSERT INTO article_drafts
+       (id, article_path, base_sha, status, permalink, source_format, title, description,
+        published_at, categories_json, tags_json, cover_url, body, revision, created_at,
+        updated_at, created_by, updated_by)
+       VALUES (?, ?, ?, 'DRAFT', ?, 'mdx', ?, ?, ?, ?, ?, NULL, ?, 1, 1, 1, '123', '123')`
+    ).bind(
+      id, articlePath, articleSha, '2026/01/01/existing-article', 'Private revision',
+      'Private description', '2026-01-01', '["Engineering"]', '["Astro"]', '# Private update'
+    ).run();
+    const headers = {
+      Cookie: session,
+      Origin: config.SITE_ORIGIN,
+      'Content-Type': 'application/json',
+      'X-CSRF-Token': csrfToken
+    };
+    const endpoint = `/api/admin/drafts/d_${id}/publish`;
+    const payload = JSON.stringify({ expectedRevision: 1 });
+    expect((await invoke(endpoint, {
+      method: 'POST',
+      headers: { Origin: config.SITE_ORIGIN, 'Content-Type': 'application/json' },
+      body: payload
+    })).status).toBe(401);
+    expect((await invoke(endpoint, {
+      method: 'POST', headers: { ...headers, 'X-CSRF-Token': 'invalid' }, body: payload
+    })).status).toBe(403);
+
+    githubEnabled = true;
+    const stale = await invoke(endpoint, { method: 'POST', headers, body: JSON.stringify({ expectedRevision: 2 }) },
+      gitHubAppKeyOverrides());
+    expect(stale.status).toBe(409);
+    expect(githubRequests).toEqual([]);
+
+    currentArticleSha = 'b'.repeat(40);
+    const changedBase = await invoke(endpoint, { method: 'POST', headers, body: payload }, gitHubAppKeyOverrides());
+    expect(changedBase.status).toBe(409);
+    expect(await changedBase.json()).toMatchObject({ error: 'base_conflict' });
+    expect(githubRequests.some(({ method, url }) => method === 'POST' && url.endsWith('/git/refs'))).toBe(false);
+    currentArticleSha = articleSha;
+
+    const first = await invoke(endpoint, { method: 'POST', headers, body: payload }, gitHubAppKeyOverrides());
+    expect(first.status).toBe(200);
+    const firstResult = await first.json() as {
+      draft: { publicationState: string; pullRequestNumber: number; revision: number };
+      pullRequest: { number: number; state: string; url: string };
+    };
+    expect(firstResult.draft).toMatchObject({
+      publicationState: 'OPEN',
+      pullRequestNumber: 42,
+      revision: 1
+    });
+    expect((await env.DB.prepare('SELECT publication_branch FROM article_drafts WHERE id = ?')
+      .bind(id).first<{ publication_branch: string }>())?.publication_branch)
+      .toBe(`blog/draft-${id.replaceAll('-', '')}-r1`);
+    expect(firstResult.pullRequest).toMatchObject({
+      number: 42,
+      state: 'OPEN',
+      url: 'https://github.com/KevinQCZ/KevinQCZ.github.io/pull/42'
+    });
+    expect(githubRequests.some(({ url, method }) => method === 'POST' && url.endsWith('/git/refs'))).toBe(true);
+    expect(githubRequests.some(({ url, method }) => method === 'POST' && url.endsWith('/pulls'))).toBe(true);
+    const write = githubRequests.find(({ method, url }) => method === 'PUT' && url.includes('/contents/'));
+    expect(write?.url).toBe(`https://api.github.com/repos/KevinQCZ/KevinQCZ.github.io/contents/${articlePath}`);
+    expect(branchSource).toContain('title: Private revision');
+    expect(branchSource).toContain('# Private update');
+
+    const revisionUpdate = await invoke(`/api/admin/drafts/d_${id}`, {
+      method: 'PUT',
+      headers,
+      body: JSON.stringify({
+        articleId: null,
+        permalink: '2026/01/01/existing-article',
+        sourceFormat: 'mdx',
+        title: 'Revised private title',
+        description: 'Private description',
+        publishedAt: '2026-01-01',
+        categories: ['Engineering'],
+        tags: ['Astro'],
+        coverUrl: null,
+        body: '# Revised private update',
+        expectedRevision: 1
+      })
+    });
+    expect(revisionUpdate.status).toBe(200);
+    const updated = await invoke(endpoint, {
+      method: 'POST', headers, body: JSON.stringify({ expectedRevision: 2 })
+    }, gitHubAppKeyOverrides());
+    expect(updated.status).toBe(200);
+    expect((await updated.json()).pullRequest).toMatchObject({ number: 42, state: 'OPEN' });
+    expect(githubRequests.filter(({ method, url }) => method === 'POST' && url.endsWith('/pulls'))).toHaveLength(1);
+    expect(branchSource).toContain('title: Revised private title');
+    expect(branchSource).toContain('# Revised private update');
+
+    await invoke(`/api/admin/drafts/d_${id}`, {
+      method: 'PUT',
+      headers,
+      body: JSON.stringify({
+        articleId: null,
+        permalink: '2026/01/01/existing-article',
+        sourceFormat: 'mdx',
+        title: 'Closed PR revision',
+        description: 'Private description',
+        publishedAt: '2026-01-01',
+        categories: ['Engineering'],
+        tags: ['Astro'],
+        coverUrl: null,
+        body: '# Reopen the review',
+        expectedRevision: 2
+      })
+    });
+    pullRequestState = 'closed';
+    const reopened = await invoke(endpoint, {
+      method: 'POST', headers, body: JSON.stringify({ expectedRevision: 3 })
+    }, gitHubAppKeyOverrides());
+    expect(reopened.status).toBe(200);
+    expect((await reopened.json()).pullRequest).toMatchObject({ number: 42, state: 'OPEN' });
+    expect(githubRequests.some(({ method, url }) => method === 'PATCH' && url.endsWith('/pulls/42'))).toBe(true);
+    expect(githubRequests.filter(({ method, url }) => method === 'POST' && url.endsWith('/pulls'))).toHaveLength(1);
+
+    currentArticleSha = updatedArticleSha;
+    currentArticleSource = branchSource;
+    pullRequestState = 'merged';
+    const refreshed = await invoke('/api/admin/articles', {
+      headers: { Cookie: session }
+    }, gitHubAppKeyOverrides());
+    expect(refreshed.status).toBe(200);
+    expect(await refreshed.json()).toMatchObject({
+      articles: [expect.objectContaining({ articlePath, sha: updatedArticleSha })],
+      drafts: []
+    });
+    expect(await env.DB.prepare('SELECT status, publication_state, base_sha FROM article_drafts WHERE id = ?')
+      .bind(id).first()).toMatchObject({
+        status: 'PUBLISHED',
+        publication_state: 'MERGED',
+        base_sha: updatedArticleSha
+      });
   });
 
   it('creates a new draft only for a collision-free path and enforces CSRF, metadata, path and origin validation', async () => {

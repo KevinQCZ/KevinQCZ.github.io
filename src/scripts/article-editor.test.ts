@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { mountArticleEditor } from './article-editor';
 import { mountArticleEditorUi } from './article-editor-ui';
 import { renderSafeMarkdown } from './editor-preview';
+import { clearAdminSession } from './admin-auth';
 import type { AdminSession, ArticleDraft, EditorSeed } from './article-editor-types';
 
 vi.mock('codemirror', () => {
@@ -31,6 +32,7 @@ const seed: EditorSeed = {
 };
 
 const session: AdminSession = {
+  accessToken: 'a'.repeat(43),
   csrfToken: 'test-csrf-token',
   user: { githubId: '123', githubLogin: 'approved-user', role: 'ADMIN' }
 };
@@ -43,6 +45,8 @@ function createRoot(): HTMLElement {
 describe('editor authorization bootstrap', () => {
   beforeEach(() => {
     document.body.innerHTML = '';
+    window.history.replaceState(null, '', '/');
+    clearAdminSession('https://api.example.test');
   });
 
   it('does not load editor controls for a guest', async () => {
@@ -51,28 +55,38 @@ describe('editor authorization bootstrap', () => {
     root.dataset.articleLocator = JSON.stringify({ articleId: seed.articleId, permalink: seed.permalink });
     const loadEditor = vi.fn();
     await mountArticleEditor(root, {
-      fetcher: vi.fn(async () => Response.json({ authenticated: false }, { status: 401 })),
+      fetcher: vi.fn(),
       loadEditor
     });
     expect(loadEditor).not.toHaveBeenCalled();
     expect(root.querySelector('[data-editor-toggle]')).toBeNull();
+    expect(root.querySelector('a')?.textContent).toContain('Sign in with GitHub');
   });
 
   it('loads the editor only for the server-derived ADMIN role', async () => {
     const root = createRoot();
     root.dataset.apiOrigin = 'https://api.example.test';
     root.dataset.articleLocator = JSON.stringify({ articleId: seed.articleId, permalink: seed.permalink });
+    window.history.replaceState(null, '', `/#copilot_auth=${'b'.repeat(43)}`);
     const mountArticleEditorUi = vi.fn();
     await mountArticleEditor(root, {
       fetcher: vi.fn()
         .mockResolvedValueOnce(Response.json({
+          token: session.accessToken,
           authenticated: true,
-          user: { githubId: '123', githubLogin: 'approved-user', role: 'ADMIN' },
-          csrfToken: 'test-csrf-token'
+          user: session.user,
+          csrfToken: session.csrfToken
+        }))
+        .mockResolvedValueOnce(Response.json({
+          authenticated: true,
+          user: session.user,
+          csrfToken: session.csrfToken
         }))
         .mockResolvedValueOnce(Response.json({ article: { ...seed, articleId: seed.id }, draft: null })),
       loadEditor: async () => ({ mountArticleEditorUi })
     });
+    expect(localStorage.length).toBe(0);
+    expect(sessionStorage.length).toBe(0);
     expect(mountArticleEditorUi).toHaveBeenCalledWith(
       root,
       'https://api.example.test',
@@ -170,7 +184,11 @@ describe('in-page article editor', () => {
           ...savedPayload,
           revision: 1,
           createdAt: 100,
-          updatedAt: 100
+          updatedAt: 100,
+          publicationState: 'NOT_SUBMITTED',
+          pullRequestNumber: null,
+          pullRequestUrl: null,
+          submittedRevision: null
         }
       });
     });
@@ -210,10 +228,87 @@ describe('in-page article editor', () => {
     });
     expect(fetcher.mock.calls[0]?.[1]).toMatchObject({
       method: 'POST',
-      credentials: 'include',
-      headers: expect.objectContaining({ 'X-CSRF-Token': session.csrfToken })
+      credentials: 'omit',
+      headers: expect.any(Headers)
     });
+    expect(new Headers(fetcher.mock.calls[0]?.[1]?.headers).get('Authorization')).toBe(`Bearer ${session.accessToken}`);
+    expect(new Headers(fetcher.mock.calls[0]?.[1]?.headers).get('X-CSRF-Token')).toBe(session.csrfToken);
     expect(root.querySelector('[data-save]')?.hasAttribute('disabled')).toBe(true);
+  });
+
+  it('creates a reviewable pull request only after the draft is saved', async () => {
+    const root = createRoot();
+    let savedDraft: ArticleDraft | null = null;
+    const fetcher = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'POST' && String(_input).endsWith('/api/admin/drafts')) {
+        const payload = JSON.parse(String(init.body)) as Record<string, unknown>;
+        savedDraft = {
+          id: 'd_12345678-1234-4234-8234-123456789abc',
+          articlePath: seed.articlePath,
+          baseSha: seed.sha,
+          status: 'DRAFT',
+          permalink: String(payload.permalink),
+          sourceFormat: 'mdx',
+          title: String(payload.title),
+          description: String(payload.description),
+          publishedAt: String(payload.publishedAt),
+          categories: payload.categories as string[],
+          tags: payload.tags as string[],
+          coverUrl: null,
+          body: String(payload.body),
+          revision: 1,
+          createdAt: 100,
+          updatedAt: 100,
+          publicationState: 'NOT_SUBMITTED',
+          pullRequestNumber: null,
+          pullRequestUrl: null,
+          submittedRevision: null
+        };
+        return Response.json({
+          draft: savedDraft
+        });
+      }
+      if (init?.method === 'POST' && String(_input).endsWith('/publish')) {
+        if (!savedDraft) throw new Error('Draft must be saved before publication.');
+        return Response.json({
+          draft: {
+            ...savedDraft,
+            status: 'PENDING_PUBLICATION',
+            publicationState: 'OPEN',
+            pullRequestNumber: 42,
+            pullRequestUrl: 'https://github.com/KevinQCZ/KevinQCZ.github.io/pull/42',
+            submittedRevision: 1
+          },
+          pullRequest: {
+            number: 42,
+            url: 'https://github.com/KevinQCZ/KevinQCZ.github.io/pull/42',
+            state: 'OPEN',
+            mergeCommitSha: null
+          }
+        });
+      }
+      throw new Error(`Unexpected request: ${String(_input)}`);
+    });
+    await mountArticleEditorUi(root, 'https://api.example.test', seed, session, fetcher);
+    const title = root.querySelector<HTMLInputElement>('[data-field="title"]')!;
+    title.value = 'PR-ready title';
+    title.dispatchEvent(new Event('input', { bubbles: true }));
+    root.querySelector<HTMLButtonElement>('[data-save]')!.click();
+    await vi.waitFor(() => expect(root.querySelector('[data-publish]')?.hasAttribute('disabled')).toBe(false));
+
+    root.querySelector<HTMLButtonElement>('[data-publish]')!.click();
+    await vi.waitFor(() => expect(root.querySelector('[data-pull-request]')?.hasAttribute('hidden')).toBe(false));
+
+    const publish = fetcher.mock.calls.find(([url]) => String(url).endsWith('/publish'));
+    expect(publish?.[0]).toBe(
+      'https://api.example.test/api/admin/drafts/d_12345678-1234-4234-8234-123456789abc/publish'
+    );
+    expect(publish?.[1]?.method).toBe('POST');
+    expect(JSON.parse(String(publish?.[1]?.body))).toEqual({ expectedRevision: 1 });
+    expect(new Headers(publish?.[1]?.headers).get('Authorization')).toBe(`Bearer ${session.accessToken}`);
+    expect(root.querySelector('[data-pull-request]')?.getAttribute('href'))
+      .toBe('https://github.com/KevinQCZ/KevinQCZ.github.io/pull/42');
+    expect(root.querySelector('[data-editor-status]')?.textContent).toContain('Merge it to publish');
   });
 
   it('creates new drafts with an editable generated permalink, then keeps it fixed', async () => {
@@ -241,7 +336,11 @@ describe('in-page article editor', () => {
           status: 'DRAFT',
           revision: 1,
           createdAt: 100,
-          updatedAt: 100
+          updatedAt: 100,
+          publicationState: 'NOT_SUBMITTED',
+          pullRequestNumber: null,
+          pullRequestUrl: null,
+          submittedRevision: null
         }
       });
     });
@@ -290,7 +389,11 @@ describe('in-page article editor', () => {
       body: seed.body,
       revision: 4,
       createdAt: 100,
-      updatedAt: 200
+      updatedAt: 200,
+      publicationState: 'NOT_SUBMITTED',
+      pullRequestNumber: null,
+      pullRequestUrl: null,
+      submittedRevision: null
     };
     const fetcher = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
       const saved = JSON.parse(String(init?.body)) as Record<string, unknown>;
