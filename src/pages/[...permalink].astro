@@ -32,7 +32,19 @@ export async function getStaticPaths() {
 
 const { article, newerArticle, olderArticle } = Astro.props as Props;
 const { Content, headings } = await render(article as CollectionEntry<'articles'>);
-const { title, description, publishedAt, categories, tags } = article.data;
+const { title, description, publishedAt, categories, tags, cover } = article.data;
+const editorSeed = {
+  permalink: article.data.permalink,
+  sourceFormat: article.filePath?.endsWith('.md') ? 'md' : 'mdx',
+  title,
+  description,
+  publishedAt: publishedAt.toISOString().slice(0, 10),
+  categories,
+  tags,
+  coverUrl: cover ?? null,
+  body: article.body ?? ''
+};
+const apiOrigin = import.meta.env.PUBLIC_AUTH_API_ORIGIN ?? '';
 ---
 
 <SiteLayout
@@ -40,62 +52,75 @@ const { title, description, publishedAt, categories, tags } = article.data;
   description={description}
   type="article"
   publishedTime={publishedAt}
+  socialImage={cover}
   noindex={!hasPublishedBody(article)}
 >
   <div class="site-page article-page">
     <div class="site-page-inner">
-      <PageIntro eyebrow="Writing" title={title} description={description} />
-      <article class="article-detail">
-        <div class="article-detail-meta">
-          <time datetime={publishedAt.toISOString()}>{formatArticleDate(publishedAt)}</time>
-          {(categories.length > 0 || tags.length > 0) && (
-            <ul class="article-taxonomies" aria-label="Topics">
-              {categories.map((category) => (
-                <li><a href={taxonomyUrl('categories', category)}>{category}</a></li>
-              ))}
-              {tags.map((tag) => (
-                <li><a href={taxonomyUrl('tags', tag)}>#{tag}</a></li>
-              ))}
-            </ul>
+      <div
+        data-article-editor
+        data-api-origin={apiOrigin}
+        data-article-seed={JSON.stringify(editorSeed)}
+      ></div>
+      <div data-article-read-mode>
+        <PageIntro eyebrow="Writing" title={title} description={description} />
+        <article class="article-detail">
+          <div class="article-detail-meta">
+            <time datetime={publishedAt.toISOString()}>{formatArticleDate(publishedAt)}</time>
+            {(categories.length > 0 || tags.length > 0) && (
+              <ul class="article-taxonomies" aria-label="Topics">
+                {categories.map((category) => (
+                  <li><a href={taxonomyUrl('categories', category)}>{category}</a></li>
+                ))}
+                {tags.map((tag) => (
+                  <li><a href={taxonomyUrl('tags', tag)}>#{tag}</a></li>
+                ))}
+              </ul>
+            )}
+          </div>
+
+          {headings.length > 0 && (
+            <nav class="table-of-contents" aria-labelledby="toc-title">
+              <h2 id="toc-title">On this page</h2>
+              <ol>
+                {headings.map((heading) => (
+                  <li class={`toc-level-${heading.depth}`}>
+                    <a href={`#${heading.slug}`}>{heading.text}</a>
+                  </li>
+                ))}
+              </ol>
+            </nav>
           )}
-        </div>
 
-        {headings.length > 0 && (
-          <nav class="table-of-contents" aria-labelledby="toc-title">
-            <h2 id="toc-title">On this page</h2>
-            <ol>
-              {headings.map((heading) => (
-                <li class={`toc-level-${heading.depth}`}>
-                  <a href={`#${heading.slug}`}>{heading.text}</a>
-                </li>
-              ))}
-            </ol>
-          </nav>
-        )}
+          <div class="article-body">
+            {hasPublishedBody(article) ? (
+              <Content />
+            ) : (
+              <p class="empty-state">This archived post has no published body.</p>
+            )}
+          </div>
+        </article>
 
-        <div class="article-body">
-          {hasPublishedBody(article) ? (
-            <Content />
-          ) : (
-            <p class="empty-state">This archived post has no published body.</p>
-          )}
-        </div>
-      </article>
-
-      <nav class="article-pagination" aria-label="Article navigation">
-        {newerArticle ? (
-          <a href={articleUrl(newerArticle)}>
-            <span>Newer article</span>
-            <strong>{newerArticle.data.title}</strong>
-          </a>
-        ) : <span aria-hidden="true"></span>}
-        {olderArticle ? (
-          <a href={articleUrl(olderArticle)}>
-            <span>Older article</span>
-            <strong>{olderArticle.data.title}</strong>
-          </a>
-        ) : <span aria-hidden="true"></span>}
-      </nav>
+        <nav class="article-pagination" aria-label="Article navigation">
+          {newerArticle ? (
+            <a href={articleUrl(newerArticle)}>
+              <span>Newer article</span>
+              <strong>{newerArticle.data.title}</strong>
+            </a>
+          ) : <span aria-hidden="true"></span>}
+          {olderArticle ? (
+            <a href={articleUrl(olderArticle)}>
+              <span>Older article</span>
+              <strong>{olderArticle.data.title}</strong>
+            </a>
+          ) : <span aria-hidden="true"></span>}
+        </nav>
+      </div>
     </div>
   </div>
+  <script>
+    import { mountArticleEditor } from '../scripts/article-editor';
+    const root = document.querySelector<HTMLElement>('[data-article-editor]');
+    if (root) void mountArticleEditor(root);
+  </script>
 </SiteLayout>

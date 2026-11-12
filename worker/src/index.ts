@@ -34,10 +34,32 @@ interface AuthContext {
   token: string;
 }
 
+interface ArticleDraft {
+  sourceFormat: 'md' | 'mdx';
+  title: string;
+  description: string;
+  publishedAt: string;
+  categories: string[];
+  tags: string[];
+  coverUrl: string | null;
+  body: string;
+  expectedRevision: number | null;
+}
+
+interface StoredArticleDraft extends Omit<ArticleDraft, 'expectedRevision' | 'coverUrl'> {
+  permalink: string;
+  coverUrl: string | null;
+  revision: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
 const SESSION_COOKIE = '__Host-admin_session';
 const TRANSACTION_COOKIE = '__Host-oauth_transaction';
 const SESSION_SECONDS = 24 * 60 * 60;
 const TRANSACTION_SECONDS = 10 * 60;
+const MAX_DRAFT_REQUEST_BYTES = 400 * 1024;
+const MAX_DRAFT_BODY_BYTES = 256 * 1024;
 const encoder = new TextEncoder();
 
 function origin(value: string): string {
@@ -204,6 +226,123 @@ async function providerJson(response: Response): Promise<unknown> {
   return JSON.parse(new TextDecoder().decode(bytes));
 }
 
+class PayloadTooLargeError extends Error {}
+
+async function requestJson(request: Request): Promise<unknown> {
+  const contentLength = Number(request.headers.get('Content-Length'));
+  if (Number.isFinite(contentLength) && contentLength > MAX_DRAFT_REQUEST_BYTES) {
+    throw new PayloadTooLargeError();
+  }
+  if (!request.body) throw new SyntaxError('Missing request body');
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > MAX_DRAFT_REQUEST_BYTES) {
+      await reader.cancel();
+      throw new PayloadTooLargeError();
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return JSON.parse(new TextDecoder().decode(bytes));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function validDate(value: unknown): value is string {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const timestamp = Date.parse(`${value}T00:00:00.000Z`);
+  return Number.isFinite(timestamp) && new Date(timestamp).toISOString().slice(0, 10) === value;
+}
+
+function validLabels(value: unknown, maximum: number): value is string[] {
+  return Array.isArray(value) && value.length <= maximum &&
+    value.every((label) => typeof label === 'string' && label.trim().length > 0 && label.length <= 80) &&
+    new Set(value).size === value.length;
+}
+
+function validCoverUrl(value: unknown): value is string | null {
+  if (value === null || value === '') return true;
+  if (typeof value !== 'string' || value.length > 2048) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && !url.username && !url.password;
+  } catch {
+    return false;
+  }
+}
+
+function parseArticleDraft(value: unknown): ArticleDraft | null {
+  if (!isRecord(value) || !['md', 'mdx'].includes(String(value.sourceFormat)) ||
+      typeof value.title !== 'string' || !value.title.trim() || value.title.length > 200 ||
+      typeof value.description !== 'string' || !value.description.trim() || value.description.length > 500 ||
+      !validDate(value.publishedAt) || !validLabels(value.categories, 20) ||
+      !validLabels(value.tags, 40) || !validCoverUrl(value.coverUrl) ||
+      typeof value.body !== 'string' || encoder.encode(value.body).length > MAX_DRAFT_BODY_BYTES ||
+      !(value.expectedRevision === null ||
+        (typeof value.expectedRevision === 'number' && Number.isSafeInteger(value.expectedRevision) && value.expectedRevision > 0))) {
+    return null;
+  }
+  return {
+    sourceFormat: value.sourceFormat as ArticleDraft['sourceFormat'],
+    title: value.title,
+    description: value.description,
+    publishedAt: value.publishedAt,
+    categories: value.categories,
+    tags: value.tags,
+    coverUrl: value.coverUrl === '' ? null : value.coverUrl,
+    body: value.body,
+    expectedRevision: value.expectedRevision
+  };
+}
+
+function validArticlePermalink(value: string | null): value is string {
+  return Boolean(value && value.length <= 200 &&
+    /^\d{4}\/\d{2}\/\d{2}\/[^/]+$/.test(value) &&
+    !value.split('/').some((part) => part === '.' || part === '..'));
+}
+
+function storedDraft(row: {
+  permalink: string;
+  source_format: 'md' | 'mdx';
+  title: string;
+  description: string;
+  published_at: string;
+  categories_json: string;
+  tags_json: string;
+  cover_url: string | null;
+  body: string;
+  revision: number;
+  created_at: number;
+  updated_at: number;
+}): StoredArticleDraft {
+  return {
+    permalink: row.permalink,
+    sourceFormat: row.source_format,
+    title: row.title,
+    description: row.description,
+    publishedAt: row.published_at,
+    categories: JSON.parse(row.categories_json) as string[],
+    tags: JSON.parse(row.tags_json) as string[],
+    coverUrl: row.cover_url,
+    body: row.body,
+    revision: row.revision,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
 async function start(request: Request, env: Env, cfg: Config): Promise<Response> {
   if (!await limit(request, env.AUTH_RATE_LIMITER, 'start')) return error(request, cfg, 429, 'rate_limited');
   const state = randomToken();
@@ -300,17 +439,18 @@ function validUnsafeRequest(request: Request, cfg: Config): boolean {
 }
 
 async function handle(request: Request, env: Env, cfg: Config): Promise<Response> {
-  const path = new URL(request.url).pathname;
+  const url = new URL(request.url);
+  const path = url.pathname;
   if (request.method === 'OPTIONS') {
     const method = request.headers.get('Access-Control-Request-Method');
     const requestedHeaders = (request.headers.get('Access-Control-Request-Headers') || '')
       .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
-    if (request.headers.get('Origin') !== cfg.site || !['GET', 'POST'].includes(method || '') ||
+    if (request.headers.get('Origin') !== cfg.site || !['GET', 'POST', 'PUT'].includes(method || '') ||
         requestedHeaders.some((h) => !['content-type', 'x-csrf-token'].includes(h))) {
       return error(request, cfg, 403, 'forbidden');
     }
     const h = headers(request, cfg);
-    h.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    h.set('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS');
     h.set('Access-Control-Allow-Headers', 'Content-Type, X-CSRF-Token');
     h.set('Vary', 'Origin, Access-Control-Request-Method, Access-Control-Request-Headers');
     return new Response(null, { status: 204, headers: h });
@@ -335,6 +475,80 @@ async function handle(request: Request, env: Env, cfg: Config): Promise<Response
         },
         csrfToken: await csrf(auth.token, cfg.csrfSecret)
       });
+    }
+    if (path === '/api/admin/drafts' && request.method === 'GET') {
+      const permalink = url.searchParams.getAll('permalink');
+      if (permalink.length !== 1 || !validArticlePermalink(permalink[0])) {
+        return error(request, cfg, 400, 'invalid_draft');
+      }
+      const row = await env.DB.prepare(
+        `SELECT permalink, source_format, title, description, published_at,
+                categories_json, tags_json, cover_url, body, revision, created_at, updated_at
+         FROM article_drafts WHERE permalink = ?`
+      ).bind(permalink[0]).first<{
+        permalink: string; source_format: 'md' | 'mdx'; title: string; description: string;
+        published_at: string; categories_json: string; tags_json: string; cover_url: string | null;
+        body: string; revision: number; created_at: number; updated_at: number;
+      }>();
+      return row
+        ? json(request, cfg, 200, { draft: storedDraft(row) })
+        : error(request, cfg, 404, 'not_found');
+    }
+    if (path === '/api/admin/drafts' && request.method === 'PUT') {
+      const csrfError = await requireCsrfProtection(request, auth, cfg);
+      if (csrfError) return csrfError;
+      if (url.searchParams.getAll('permalink').length !== 1 ||
+          !validArticlePermalink(url.searchParams.get('permalink'))) {
+        return error(request, cfg, 400, 'invalid_draft');
+      }
+      if (!await limit(request, env.WRITE_RATE_LIMITER, 'draft-save')) {
+        return error(request, cfg, 429, 'rate_limited');
+      }
+      let payload: unknown;
+      try {
+        payload = await requestJson(request);
+      } catch (cause) {
+        return cause instanceof PayloadTooLargeError
+          ? error(request, cfg, 413, 'payload_too_large')
+          : error(request, cfg, 400, 'invalid_json');
+      }
+      const draft = parseArticleDraft(payload);
+      if (!draft) return error(request, cfg, 400, 'invalid_draft');
+      const permalink = url.searchParams.get('permalink')!;
+      const now = Date.now();
+      const values = [
+        draft.sourceFormat, draft.title, draft.description, draft.publishedAt,
+        JSON.stringify(draft.categories), JSON.stringify(draft.tags), draft.coverUrl, draft.body
+      ];
+      const row = draft.expectedRevision === null
+        ? await env.DB.prepare(
+          `INSERT INTO article_drafts
+           (permalink, source_format, title, description, published_at, categories_json, tags_json,
+            cover_url, body, revision, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+           ON CONFLICT(permalink) DO NOTHING
+           RETURNING permalink, source_format, title, description, published_at,
+                     categories_json, tags_json, cover_url, body, revision, created_at, updated_at`
+        ).bind(permalink, ...values, now, now).first<{
+          permalink: string; source_format: 'md' | 'mdx'; title: string; description: string;
+          published_at: string; categories_json: string; tags_json: string; cover_url: string | null;
+          body: string; revision: number; created_at: number; updated_at: number;
+        }>()
+        : await env.DB.prepare(
+          `UPDATE article_drafts
+           SET source_format = ?, title = ?, description = ?, published_at = ?, categories_json = ?,
+               tags_json = ?, cover_url = ?, body = ?, revision = revision + 1, updated_at = ?
+           WHERE permalink = ? AND revision = ?
+           RETURNING permalink, source_format, title, description, published_at,
+                     categories_json, tags_json, cover_url, body, revision, created_at, updated_at`
+        ).bind(...values, now, permalink, draft.expectedRevision).first<{
+          permalink: string; source_format: 'md' | 'mdx'; title: string; description: string;
+          published_at: string; categories_json: string; tags_json: string; cover_url: string | null;
+          body: string; revision: number; created_at: number; updated_at: number;
+        }>();
+      return row
+        ? json(request, cfg, 200, { draft: storedDraft(row) })
+        : error(request, cfg, 409, 'revision_conflict');
     }
     if (path === '/api/logout' && request.method === 'POST') {
       const csrfError = await requireCsrfProtection(request, auth, cfg);

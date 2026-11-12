@@ -1,0 +1,301 @@
+.article-editor {
+  margin: 0 0 28px;
+}
+
+.article-editor-bar,
+.article-editor-toolbar,
+.article-editor-actions,
+.article-editor-tabs {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.article-editor-bar,
+.article-editor-toolbar {
+  justify-content: space-between;
+}
+
+.article-editor-bar {
+  border-bottom: 1px solid var(--border);
+  padding: 12px 0;
+}
+
+.article-editor-bar p,
+.article-editor-toolbar p {
+  margin: 0;
+}
+
+.article-editor-panel {
+  margin-top: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+  padding: 16px;
+}
+
+.article-editor-panel[hidden] {
+  display: none;
+}
+
+.article-editor-toolbar {
+  flex-wrap: wrap;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 14px;
+}
+
+.article-editor-actions {
+  flex-wrap: wrap;
+}
+
+.article-editor-status,
+.article-editor-toolbar [data-editor-status] {
+  color: var(--text-muted);
+}
+
+.article-editor-toolbar [data-error="true"],
+.article-editor-error {
+  color: #b42318;
+}
+
+:root[data-theme="dark"] .article-editor-toolbar [data-error="true"],
+:root[data-theme="dark"] .article-editor-error {
+  color: #ff9a90;
+}
+
+.article-editor-tabs {
+  display: none;
+  margin: 14px 0;
+}
+
+.article-editor-tabs button {
+  min-height: 42px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: var(--surface-soft);
+  color: var(--text);
+  padding: 8px 14px;
+  cursor: pointer;
+}
+
+.article-editor-tabs button[aria-selected="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.article-editor-workspace {
+  display: grid;
+  grid-template-columns: minmax(210px, 0.7fr) minmax(0, 1fr) minmax(0, 1fr);
+  align-items: start;
+  gap: 16px;
+  padding-top: 16px;
+}
+
+.article-editor-metadata,
+.article-editor-source,
+.article-editor-preview {
+  min-width: 0;
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: var(--surface);
+  padding: 14px;
+}
+
+.article-editor-metadata {
+  display: grid;
+  gap: 8px;
+}
+
+.article-editor-metadata legend {
+  padding: 0 6px;
+  font-weight: 700;
+}
+
+.article-editor-metadata label {
+  font-weight: 600;
+}
+
+.article-editor-metadata label span {
+  color: var(--text-muted);
+  font-size: 0.85em;
+  font-weight: 400;
+}
+
+.article-editor-metadata input,
+.article-editor-metadata textarea {
+  width: 100%;
+  min-height: 42px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: var(--page);
+  color: var(--text);
+  padding: 9px 10px;
+  font: inherit;
+}
+
+.article-editor-metadata textarea {
+  resize: vertical;
+}
+
+.article-editor-metadata input:focus-visible,
+.article-editor-metadata textarea:focus-visible,
+.article-editor button:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.article-editor-permalink,
+.article-editor-help,
+.article-editor-notice {
+  color: var(--text-muted);
+  font-size: 0.875rem;
+}
+
+.article-editor-error:empty {
+  display: none;
+}
+
+.article-editor-source h2,
+.article-editor-preview h2 {
+  margin: 0 0 10px;
+  font-size: 1.1rem;
+}
+
+.article-editor-source [data-code-editor],
+.article-editor-source [data-code-fallback] {
+  min-height: 420px;
+}
+
+.article-editor-source [data-code-fallback] {
+  width: 100%;
+  border: 1px solid var(--border);
+  background: var(--page);
+  color: var(--text);
+  font: 0.9rem/1.6 ui-monospace, SFMono-Regular, Consolas, monospace;
+  padding: 12px;
+  resize: vertical;
+}
+
+.article-editor-source .cm-editor {
+  min-height: 420px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: var(--page);
+  color: var(--text);
+  font: 0.9rem/1.6 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.article-editor-source .cm-editor.cm-focused {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.article-editor-source .cm-scroller {
+  overflow: auto;
+  font-family: inherit;
+}
+
+.article-editor-preview-body {
+  min-height: 420px;
+  margin-top: 14px;
+  overflow-wrap: anywhere;
+}
+
+.article-editor-preview-meta {
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 12px;
+}
+
+.article-editor-preview-meta h3 {
+  margin: 0 0 8px;
+}
+
+.article-editor-preview-meta p {
+  margin: 6px 0;
+  color: var(--text-muted);
+}
+
+.article-editor-preview-body .editor-cover-preview {
+  display: block;
+  max-height: 320px;
+  width: 100%;
+  margin: 0 0 20px;
+  border-radius: var(--radius-control);
+  object-fit: cover;
+}
+
+.article-editor-notice {
+  border-left: 3px solid var(--accent);
+  padding-left: 10px;
+}
+
+.preview-image-placeholder {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+@media (min-width: 768px) and (max-width: 1099px) {
+  .article-editor-workspace {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .article-editor-metadata {
+    grid-column: 1 / -1;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .article-editor-metadata legend,
+  .article-editor-permalink {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (max-width: 767px) {
+  .article-editor-panel {
+    padding: 12px;
+  }
+
+  .article-editor-bar,
+  .article-editor-toolbar {
+    align-items: flex-start;
+  }
+
+  .article-editor-tabs {
+    display: flex;
+  }
+
+  .article-editor-workspace {
+    display: block;
+    padding-top: 0;
+  }
+
+  .article-editor-workspace > * + * {
+    margin-top: 12px;
+  }
+
+  .article-editor-workspace[data-active-tab="editor"] [data-preview-pane],
+  .article-editor-workspace[data-active-tab="preview"] [data-source-pane],
+  .article-editor-workspace[data-active-tab="preview"] [data-metadata] {
+    display: none;
+  }
+
+  .article-editor-source [data-code-editor],
+  .article-editor-source [data-code-fallback],
+  .article-editor-source .cm-editor,
+  .article-editor-preview-body {
+    min-height: 55vh;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .article-editor *,
+  .article-editor *::before,
+  .article-editor *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
