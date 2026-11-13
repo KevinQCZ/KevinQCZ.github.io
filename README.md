@@ -161,6 +161,8 @@ or replace the token automatically. It supports the existing authentication
 Worker's six variables, three secret-name bindings, one D1 binding and two rate
 limits, with no custom routes/domains or tail consumers. Unknown or missing
 settings, bindings, or traffic splitting stop deployment for review.
+Deployment history is read across all reported pages; incomplete, duplicate, or
+changing pagination also stops deployment before upload.
 
 Non-secret resource/runtime settings are written to a short-lived, Git-ignored
 `worker/.deploy-*/wrangler.json`, then Wrangler compiles the real API entry point
