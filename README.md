@@ -137,6 +137,39 @@ credentials, or deployed Worker URL are present in this repository. The
 placeholders above are not production values; remote migrations and deployment
 must wait until you configure and verify the actual resources.
 
+### Diagnosing OAuth callback failures
+
+The Worker returns a generic `service_unavailable` response for unexpected
+errors. For an exception during the GitHub OAuth callback, the Worker runtime
+log includes the response's `X-Request-ID` and an allowlisted
+`callback_stage`. This identifies the failing stage, not the underlying cause.
+Ordinary provider errors and other expected responses retain their existing
+status codes. A non-success HTTP response from the token endpoint is logged
+separately with the request ID and `token_response_status`, without its body.
+A successful response without a token is recorded only as an allowlisted
+`token_response_error` value.
+The token exchange distinguishes an exception making the request
+(`token_exchange_request`) from reading or parsing its response
+(`token_exchange_response`). Request exceptions also get a best-effort,
+allowlisted `token_request_failure` category; `other` means the cause is
+unknown. Rejected token endpoint redirects additionally record their status,
+an allowlisted host category, and whether their path and scheme match; the
+redirect is never followed or logged in full. Raw exception messages are never
+logged by this application.
+
+In the Cloudflare dashboard, select the deployed Worker and open its runtime
+logs under **Observability** (enable logs if required). These are separate
+from **Builds** logs. Start a fresh login from the site and find the runtime
+entry matching the response's `X-Request-ID`. Dashboard labels and log
+availability can vary by configuration. Share only the request ID and stage;
+do not share callback URLs, authorization codes, state, cookies, tokens, or
+secrets. This application log excludes those values, but other platform
+request logs or screenshots may contain them.
+
+Deploy diagnostics only after verifying the target Worker, environment, D1
+binding, rate limiters, variables, and secrets. Do not recreate the database or
+overwrite production configuration to troubleshoot a callback.
+
 ### Using the editor to publish
 
 1. Open a published article on `https://kevinqcz.github.io/` and select **Sign in
