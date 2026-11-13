@@ -137,6 +137,30 @@ credentials, or deployed Worker URL are present in this repository. The
 placeholders above are not production values; remote migrations and deployment
 must wait until you configure and verify the actual resources.
 
+### Cloudflare Workers Builds previews
+
+The previously reported Preview command, `npx wrangler preview`, failed because
+the configuration it resolved had no required `previews` block. Use the
+version-controlled `worker/wrangler.preview.jsonc` explicitly. It names the
+existing Worker and its real entry point, but has an empty `previews` block and
+no database, rate-limit bindings, runtime variables, or credentials. The
+preview therefore cannot sign in, access drafts, or publish.
+
+In the Cloudflare dashboard, open **Workers & Pages** → `kevinqcz-github-io` →
+**Settings** → **Build**. Verify the root directory is the repository root
+(blank or `.`), then change only the Preview command to:
+
+```sh
+npx wrangler preview --config worker/wrangler.preview.jsonc --ignore-base-config
+```
+
+Keep the existing Build and Deploy commands, API token, production bindings,
+variables, and secrets unchanged. `--ignore-base-config` prevents dashboard
+Preview Base settings from being inherited. The Preview command is shared by
+all non-production branches, so existing branches that do not contain this
+config must sync it from `master` before they can create previews. This change
+does not address the separate production build failure on `master`.
+
 ### Using the editor to publish
 
 1. Open a published article on `https://kevinqcz.github.io/` and select **Sign in
