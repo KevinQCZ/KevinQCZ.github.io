@@ -127,9 +127,8 @@ test('metadata API failures stop before deployment and redact provider diagnosti
   );
 });
 
-test('reads existing production state using only authenticated GET requests', async () => {
-  const state = fixture();
-  const fakeFetch = async (url, init) => {
+function productionFetch(state) {
+  return async (url, init) => {
     assert.equal(init.method, undefined);
     assert.equal(init.headers.Authorization, 'Bearer test-token');
     let result;
@@ -153,7 +152,56 @@ test('reads existing production state using only authenticated GET requests', as
     else assert.fail('Unexpected endpoint');
     return Response.json({ success: true, result });
   };
+}
+
+test('reads existing production state using only authenticated GET requests', async () => {
+  const state = fixture();
+  const fakeFetch = productionFetch(state);
   assert.deepEqual(await readProductionState(accountId, 'test-token', fakeFetch), state);
+});
+
+function paginatedFetch(state, adjust = () => {}) {
+  const fallback = productionFetch(state);
+  return async (url, init) => {
+    const parsedUrl = new URL(url);
+    if (!parsedUrl.pathname.endsWith('/deployments')) return fallback(url, init);
+    assert.equal(init.method, undefined);
+    assert.equal(init.headers.Authorization, 'Bearer test-token');
+    const page = Number(parsedUrl.searchParams.get('page') ?? 1);
+    if (page === 2) assert.equal(parsedUrl.searchParams.get('per_page'), '1');
+    const envelope = {
+      success: true,
+      result: {
+        deployments: [{
+          id: `deployment-${page}`,
+          created_on: page === 1 ? '2026-11-12T00:00:00Z' : '2026-11-13T00:00:00Z',
+          versions: [{ version_id: page === 1 ? databaseId : version, percentage: 100 }]
+        }]
+      },
+      result_info: { page, per_page: 1, count: 1, total_count: 2, total_pages: 2 }
+    };
+    if (page === 2) adjust(envelope);
+    return Response.json(envelope);
+  };
+}
+
+test('reads every deployment-history page before selecting the active version', async () => {
+  const state = fixture();
+  assert.deepEqual(await readProductionState(accountId, 'test-token', paginatedFetch(state)), state);
+});
+
+test('rejects changed, missing, duplicate or incomplete deployment-history pages', async () => {
+  for (const adjust of [
+    (envelope) => { envelope.result_info.total_count = 3; },
+    (envelope) => { delete envelope.result_info; },
+    (envelope) => { envelope.result.deployments[0].id = 'deployment-1'; },
+    (envelope) => { envelope.result.deployments = []; envelope.result_info.count = 0; }
+  ]) {
+    await assert.rejects(
+      readProductionState(accountId, 'test-token', paginatedFetch(fixture(), adjust)),
+      /pagination.*(incomplete|changed)/
+    );
+  }
 });
 
 test('temporary configuration is removed on success and on validation failure', async () => {

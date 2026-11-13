@@ -142,7 +142,54 @@ export function validateTarget({ accountId, dryRun, metadataFile }, env) {
 export async function readProductionState(accountId, token, fetchImpl = fetch) {
   const base = `https://api.cloudflare.com/client/v4/accounts/${accountId}`;
   const script = `${base}/workers/scripts/${workerName}`;
-  async function get(url, label) {
+  async function get(url, label, collectionKey) {
+    const envelope = await getPage(url, label);
+    if (collectionKey && envelope.result_info) {
+      const paginationSchema = z.object({
+        page: z.number().int().positive(),
+        per_page: z.number().int().positive(),
+        count: z.number().int().nonnegative(),
+        total_count: z.number().int().nonnegative(),
+        total_pages: z.number().int().positive()
+      });
+      const parsed = paginationSchema.safeParse(envelope.result_info);
+      if (!parsed.success) throw new Error(`Cloudflare ${label} pagination is incomplete; refusing deployment.`);
+      const info = parsed.data;
+      const items = envelope.result?.[collectionKey];
+      if (!Array.isArray(items) || info.page !== 1 || info.count !== items.length ||
+          info.total_pages !== Math.max(1, Math.ceil(info.total_count / info.per_page))) {
+        throw new Error(`Cloudflare ${label} response is incomplete; refusing deployment.`);
+      }
+      const combined = [...items];
+      for (let page = 2; page <= info.total_pages; page++) {
+        const nextUrl = new URL(url);
+        nextUrl.searchParams.set('page', `${page}`);
+        nextUrl.searchParams.set('per_page', `${info.per_page}`);
+        const next = await getPage(nextUrl.href, label);
+        const nextInfo = paginationSchema.safeParse(next.result_info);
+        const nextItems = next.result?.[collectionKey];
+        if (!nextInfo.success || nextInfo.data.page !== page ||
+            nextInfo.data.per_page !== info.per_page || nextInfo.data.total_pages !== info.total_pages ||
+            nextInfo.data.total_count !== info.total_count || !Array.isArray(nextItems) ||
+            nextInfo.data.count !== nextItems.length) {
+          throw new Error(`Cloudflare ${label} pagination changed or is incomplete; refusing deployment.`);
+        }
+        combined.push(...nextItems);
+      }
+      if (combined.length !== info.total_count ||
+          new Set(combined.map((item) => item?.id)).size !== combined.length ||
+          combined.some((item) => typeof item?.id !== 'string')) {
+        throw new Error(`Cloudflare ${label} pagination is incomplete; refusing deployment.`);
+      }
+      return { ...envelope.result, [collectionKey]: combined };
+    }
+    if (envelope.result_info?.total_pages > 1 ||
+        Array.isArray(envelope.result) && envelope.result_info?.total_count > envelope.result.length) {
+      throw new Error(`Cloudflare ${label} response is incomplete; refusing deployment.`);
+    }
+    return envelope.result;
+  }
+  async function getPage(url, label) {
     let response;
     try {
       response = await fetchImpl(url, {
@@ -160,19 +207,17 @@ export async function readProductionState(accountId, token, fetchImpl = fetch) {
     } catch {
       throw new Error(`Cloudflare ${label} returned invalid JSON.`);
     }
-    if (envelope.success !== true || envelope.result === undefined ||
-        envelope.result_info?.total_pages > 1 ||
-        Array.isArray(envelope.result) && envelope.result_info?.total_count > envelope.result.length) {
+    if (envelope.success !== true || envelope.result === undefined) {
       throw new Error(`Cloudflare ${label} response is incomplete; refusing deployment.`);
     }
-    return envelope.result;
+    return envelope;
   }
   const [settings, subdomain, routes, allDomains, deploymentResult] = await Promise.all([
     get(`${script}/settings`, 'settings'),
     get(`${script}/subdomain`, 'subdomain'),
     get(`${script}/routes`, 'routes'),
     get(`${base}/workers/domains`, 'custom domains'),
-    get(`${script}/deployments`, 'deployments')
+    get(`${script}/deployments`, 'deployments', 'deployments')
   ]);
   if (!Array.isArray(allDomains) ||
       allDomains.some((domain) => typeof domain?.service !== 'string') ||
