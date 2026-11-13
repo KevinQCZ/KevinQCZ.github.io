@@ -137,6 +137,54 @@ credentials, or deployed Worker URL are present in this repository. The
 placeholders above are not production values; remote migrations and deployment
 must wait until you configure and verify the actual resources.
 
+### Production Worker builds
+
+The static website stays on GitHub Pages; the production Cloudflare Worker is
+the authentication/draft API in `worker/src/index.ts`, not the Astro website.
+Do not use bare `npx wrangler deploy` at the repository root: without an explicit
+config it auto-configures Astro for Cloudflare and rebuilds with a different
+output layout, which breaks static-site validation.
+
+After review and merge, set the existing Worker's production **Deploy command**
+to the following, replacing the account placeholder with its verified account
+ID. Keep **Build command** as `npm run build`, the repository root, and all
+other settings unchanged:
+
+```sh
+npm run deploy:worker -- --account-id VERIFIED_ACCOUNT_ID
+```
+
+The script requires the existing build's `CLOUDFLARE_API_TOKEN` to read Worker
+settings, routing, and deployments. It does not read local credentials or
+secret values. Missing permission stops deployment; do not broaden permissions
+or replace the token automatically. It supports the existing authentication
+Worker's six variables, three secret-name bindings, one D1 binding and two rate
+limits, with no custom routes/domains or tail consumers. Unknown or missing
+settings, bindings, or traffic splitting stop deployment for review.
+
+Non-secret resource/runtime settings are written to a short-lived, Git-ignored
+`worker/.deploy-*/wrangler.json`, then Wrangler compiles the real API entry point
+with auto-configuration disabled. `--keep-vars` preserves runtime variables;
+Wrangler retains existing secrets without retrieving their values. The script
+checks for drift before deployment and compares configuration after deployment,
+without logging raw Wrangler output or runtime values. It never creates a D1
+database, runs migrations, or configures Astro. A detected post-deploy mismatch
+is a release failure requiring inspection, not an automatic rollback.
+
+For read-only compilation validation using the CI token:
+
+```sh
+npm run deploy:worker -- --account-id VERIFIED_ACCOUNT_ID --dry-run
+```
+
+Actual deployment is restricted to Workers Builds on `master`. Before enabling
+the command, verify that the reviewed source includes every fix already running
+in production: deploying an older `master` can regress authentication even when
+the build succeeds. In particular, both GitHub OAuth requests must contain the
+reviewed redirect-handling fixes before replacing the current production code.
+Do not use the Preview or local development config for production, copy another
+worktree's production config, or commit generated production settings.
+
 ### Cloudflare Workers Builds previews
 
 The previously reported Preview command, `npx wrangler preview`, failed because
