@@ -68,9 +68,13 @@ beforeEach(async () => {
   vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
     if (input === 'https://github.com/login/oauth/access_token') {
       expect(init?.method).toBe('POST');
+      expect(init?.redirect).toBe('manual');
       return Response.json({ access_token: 'dummy-oauth-token' });
     }
-    if (input === 'https://api.github.com/user') return Response.json({ id: 123, login: 'approved-user' });
+    if (input === 'https://api.github.com/user') {
+      expect(init?.redirect).toBe('manual');
+      return Response.json({ id: 123, login: 'approved-user' });
+    }
     throw new Error('Unexpected provider URL');
   });
 });
@@ -199,6 +203,7 @@ describe('OAuth and sessions', () => {
   });
 
   it('rejects provider denial and failures without leaking secrets', async () => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
     const start = await invoke('/auth/github');
     const url = new URL(start.headers.get('Location')!);
     const denied = await invoke(`/auth/github/callback?state=${url.searchParams.get('state')}&error=access_denied`, {
@@ -209,11 +214,149 @@ describe('OAuth and sessions', () => {
     const failed = await login();
     expect(failed.callback.status).toBe(502);
     expect(await failed.callback.text()).not.toMatch(/dummy-secret|dummy-code|dummy-oauth-token/);
+    expect(log).toHaveBeenCalledWith(
+      `Authentication provider unavailable (${failed.callback.headers.get('X-Request-ID')}) token_response_status=500`
+    );
+    expect(JSON.stringify(log.mock.calls)).not.toMatch(/dummy-secret|dummy-code|dummy-oauth-token/);
+  });
+
+  it.each(['rate_limit', 'transaction', 'token_exchange_request', 'token_exchange_response', 'identity', 'handoff'] as const)(
+    'logs only the safe callback stage and request ID on a %s exception',
+    async (stage) => {
+      const start = await invoke('/auth/github');
+      const url = new URL(start.headers.get('Location')!);
+      const tx = getCookie(start, '__Host-oauth_transaction');
+      const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const sensitive = 'sensitive-exception-detail';
+      const fail = () => { throw new Error(sensitive); };
+      let overrides = {};
+
+      if (stage === 'rate_limit') {
+        overrides = { AUTH_RATE_LIMITER: { limit: fail } };
+      } else if (stage === 'transaction') {
+        overrides = { DB: { prepare: fail } };
+      } else if (stage === 'handoff') {
+        overrides = { DB: { prepare: env.DB.prepare.bind(env.DB), batch: fail } };
+      } else {
+        vi.mocked(fetch).mockImplementation(async (input) => {
+          if (stage === 'token_exchange_response') {
+            return new Response(sensitive);
+          }
+          if (stage === 'identity' && input === 'https://github.com/login/oauth/access_token') {
+            return Response.json({ access_token: 'dummy-oauth-token' });
+          }
+          return fail();
+        });
+      }
+
+      const response = await invoke(
+        `/auth/github/callback?state=${url.searchParams.get('state')}&code=dummy-code`,
+        { headers: { Cookie: tx } },
+        overrides
+      );
+      expect(response.status).toBe(503);
+      expect(await response.json()).toEqual({ error: 'service_unavailable' });
+      const requestId = response.headers.get('X-Request-ID');
+      expect(requestId).toBeTruthy();
+      expect(log).toHaveBeenCalledTimes(1);
+      expect(log).toHaveBeenCalledWith(
+        `Authentication service unavailable (${requestId}) callback_stage=${stage}` +
+        (stage === 'token_exchange_request' ? ' token_request_failure=other' : '')
+      );
+      expect(JSON.stringify(log.mock.calls)).not.toMatch(/sensitive-exception-detail|dummy-code|dummy-secret|dummy-oauth-token/);
+      expect(JSON.stringify(log.mock.calls)).not.toContain(tx);
+      expect(JSON.stringify(log.mock.calls)).not.toContain(url.searchParams.get('state'));
+    }
+  );
+
+  it.each([
+    ['redirect', 'redirect is not allowed'],
+    ['timeout', 'request timed out'],
+    ['dns', 'DNS resolution failed'],
+    ['tls', 'TLS certificate failed'],
+    ['connection', 'connection refused'],
+    ['other', 'unclassified failure']
+  ])('classifies a token request %s failure without exposing the exception', async (category, reason) => {
+    const start = await invoke('/auth/github');
+    const url = new URL(start.headers.get('Location')!);
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.mocked(fetch).mockRejectedValue(new Error(`${reason}: private-exception-data`));
+    const response = await invoke(
+      `/auth/github/callback?state=${url.searchParams.get('state')}&code=dummy-code`,
+      { headers: { Cookie: getCookie(start, '__Host-oauth_transaction') } }
+    );
+    expect(response.status).toBe(503);
+    expect(log).toHaveBeenCalledWith(
+      `Authentication service unavailable (${response.headers.get('X-Request-ID')}) ` +
+      `callback_stage=token_exchange_request token_request_failure=${category}`
+    );
+    expect(JSON.stringify(log.mock.calls)).not.toContain('private-exception-data');
+  });
+
+  it('rejects token redirects without following or logging their URL', async () => {
+    const start = await invoke('/auth/github');
+    const url = new URL(start.headers.get('Location')!);
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.mocked(fetch).mockResolvedValue(new Response(null, {
+      status: 302,
+      headers: { Location: 'https://example.test/secret?code=private-redirect-data' }
+    }));
+    const response = await invoke(
+      `/auth/github/callback?state=${url.searchParams.get('state')}&code=dummy-code`,
+      { headers: { Cookie: getCookie(start, '__Host-oauth_transaction') } }
+    );
+    expect(response.status).toBe(503);
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(fetch).mock.calls[0][1]?.redirect).toBe('manual');
+    expect(log).toHaveBeenCalledWith(
+      `Authentication service unavailable (${response.headers.get('X-Request-ID')}) ` +
+      'callback_stage=token_exchange_request token_request_failure=redirect ' +
+      'token_redirect_status=302 token_redirect_host=other token_redirect_same_path=false token_redirect_https=true'
+    );
+    expect(JSON.stringify(log.mock.calls)).not.toMatch(/example\.test|private-redirect-data/);
+  });
+
+  it.each([301, 302, 303, 307, 308])('rejects identity redirects (%s) without forwarding credentials', async (status) => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      expect(init?.redirect).toBe('manual');
+      if (input === 'https://github.com/login/oauth/access_token') {
+        return Response.json({ access_token: 'dummy-oauth-token' });
+      }
+      expect(input).toBe('https://api.github.com/user');
+      expect(new Headers(init?.headers).get('Authorization')).toBe('Bearer dummy-oauth-token');
+      return new Response(null, {
+        status, headers: { Location: 'https://example.test/secret?token=private-redirect-data' }
+      });
+    });
+    const result = await login();
+    expect(result.callback.status).toBe(503);
+    expect(await result.callback.json()).toEqual({ error: 'service_unavailable' });
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+    expect(log).toHaveBeenCalledWith(
+      `Authentication service unavailable (${result.callback.headers.get('X-Request-ID')}) callback_stage=identity`
+    );
+    expect(JSON.stringify(log.mock.calls)).not.toMatch(/dummy-oauth-token|example\.test|private-redirect-data/);
+    expect(await env.DB.prepare('SELECT COUNT(*) AS count FROM oauth_handoffs').first('count')).toBe(0);
+  });
+
+  it.each([
+    ['bad_verification_code', 'bad_verification_code'],
+    ['private-provider-data', 'other']
+  ])('logs an allowlisted token response error for %s', async (providerError, expected) => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.mocked(fetch).mockResolvedValue(Response.json({ error: providerError }));
+    const result = await login();
+    expect(result.callback.status).toBe(502);
+    expect(log).toHaveBeenCalledWith(
+      `Authentication provider unavailable (${result.callback.headers.get('X-Request-ID')}) token_response_error=${expected}`
+    );
+    expect(JSON.stringify(log.mock.calls)).not.toContain('private-provider-data');
   });
 
   it('rejects oversized provider responses and never follows provider redirects', async () => {
     vi.mocked(fetch).mockImplementation(async (_url, init) => {
-      expect(init?.redirect).toBe('error');
+      expect(init?.redirect).toBe('manual');
       return new Response('x'.repeat(65537));
     });
     const result = await login();

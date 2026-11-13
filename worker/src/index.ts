@@ -37,6 +37,59 @@ interface Config {
   githubApp: GitHubAppConfig | null;
 }
 
+type CallbackStage =
+  | 'rate_limit'
+  | 'validation'
+  | 'transaction'
+  | 'token_exchange_request'
+  | 'token_exchange_response'
+  | 'identity'
+  | 'authorization'
+  | 'handoff'
+  | 'redirect';
+
+interface RequestDiagnostics {
+  callbackStage?: CallbackStage;
+  tokenRequestFailure?: 'redirect' | 'timeout' | 'dns' | 'tls' | 'connection' | 'other';
+  tokenResponseStatus?: number;
+  tokenResponseError?: 'bad_verification_code' | 'incorrect_client_credentials' | 'redirect_uri_mismatch' |
+    'access_denied' | 'unauthorized_client' | 'other';
+  tokenRedirect?: {
+    status: number;
+    host: 'github.com' | 'www.github.com' | 'api.github.com' | 'other' | 'invalid';
+    samePath: boolean;
+    https: boolean;
+  };
+}
+
+function classifyTokenRequestFailure(error: unknown): NonNullable<RequestDiagnostics['tokenRequestFailure']> {
+  const message = error instanceof Error ? error.message : '';
+  if (/redirect/i.test(message)) return 'redirect';
+  if (/timed?\s*out|timeout/i.test(message)) return 'timeout';
+  if (/dns|resolve|enotfound/i.test(message)) return 'dns';
+  if (/tls|ssl|certificate/i.test(message)) return 'tls';
+  if (/connect|network|socket|fetch failed/i.test(message)) return 'connection';
+  return 'other';
+}
+
+function classifyTokenRedirect(response: Response): NonNullable<RequestDiagnostics['tokenRedirect']> {
+  const result: NonNullable<RequestDiagnostics['tokenRedirect']> = {
+    status: response.status, host: 'invalid', samePath: false, https: false
+  };
+  const location = response.headers.get('Location');
+  if (!location) return result;
+  try {
+    const url = new URL(location, 'https://github.com/login/oauth/access_token');
+    result.host = url.host === 'github.com' || url.host === 'www.github.com' || url.host === 'api.github.com'
+      ? url.host : 'other';
+    result.samePath = url.pathname === '/login/oauth/access_token';
+    result.https = url.protocol === 'https:';
+  } catch {
+    return result;
+  }
+  return result;
+}
+
 interface Session {
   id: string;
   github_user_id: string;
@@ -869,8 +922,10 @@ async function start(request: Request, env: Env, cfg: Config): Promise<Response>
   return redirect(request, cfg, url.href, [cookie(TRANSACTION_COOKIE, browser, TRANSACTION_SECONDS)]);
 }
 
-async function callback(request: Request, env: Env, cfg: Config): Promise<Response> {
+async function callback(request: Request, env: Env, cfg: Config, diagnostics: RequestDiagnostics): Promise<Response> {
+  diagnostics.callbackStage = 'rate_limit';
   if (!await limit(request, env.AUTH_RATE_LIMITER, 'callback')) return error(request, cfg, 429, 'rate_limited');
+  diagnostics.callbackStage = 'validation';
   const params = new URL(request.url).searchParams;
   const browser = cookieValue(request, TRANSACTION_COOKIE);
   const state = params.get('state');
@@ -881,6 +936,7 @@ async function callback(request: Request, env: Env, cfg: Config): Promise<Respon
     !code || code.length > 2048 || !browser
   ) return error(request, cfg, 400, 'invalid_callback');
 
+  diagnostics.callbackStage = 'transaction';
   const transaction = await env.DB.prepare(
     `DELETE FROM oauth_transactions
      WHERE state_hash = ? AND binding_hash = ? AND expires_at > ?
@@ -889,24 +945,51 @@ async function callback(request: Request, env: Env, cfg: Config): Promise<Respon
     .first<{ verifier: string; return_to: string }>();
   if (!transaction) return error(request, cfg, 400, 'invalid_callback');
 
-  const exchange = await fetch('https://github.com/login/oauth/access_token', {
-    method: 'POST',
-    redirect: 'error',
-    headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      client_id: cfg.clientId, client_secret: cfg.clientSecret, code,
-      redirect_uri: `${cfg.api}/auth/github/callback`, code_verifier: transaction.verifier
-    })
-  });
-  if (!exchange.ok) return error(request, cfg, 502, 'provider_unavailable');
+  diagnostics.callbackStage = 'token_exchange_request';
+  let exchange: Response;
+  try {
+    exchange = await fetch('https://github.com/login/oauth/access_token', {
+      method: 'POST',
+      redirect: 'manual',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_id: cfg.clientId, client_secret: cfg.clientSecret, code,
+        redirect_uri: `${cfg.api}/auth/github/callback`, code_verifier: transaction.verifier
+      })
+    });
+    if (exchange.status >= 300 && exchange.status < 400) {
+      diagnostics.tokenRedirect = classifyTokenRedirect(exchange);
+      throw new Error('Token endpoint redirect rejected');
+    }
+  } catch (error) {
+    diagnostics.tokenRequestFailure = classifyTokenRequestFailure(error);
+    throw error;
+  }
+  if (!exchange.ok) {
+    diagnostics.tokenResponseStatus = exchange.status;
+    return error(request, cfg, 502, 'provider_unavailable');
+  }
+  diagnostics.callbackStage = 'token_exchange_response';
   const tokenResponse = await providerJson(exchange);
   if (!tokenResponse || typeof tokenResponse !== 'object' ||
       !('access_token' in tokenResponse) || typeof tokenResponse.access_token !== 'string' ||
-      !tokenResponse.access_token) return error(request, cfg, 502, 'provider_unavailable');
+      !tokenResponse.access_token) {
+    const code = tokenResponse && typeof tokenResponse === 'object' && 'error' in tokenResponse
+      ? tokenResponse.error : null;
+    diagnostics.tokenResponseError =
+      code === 'bad_verification_code' || code === 'incorrect_client_credentials' ||
+      code === 'redirect_uri_mismatch' || code === 'access_denied' || code === 'unauthorized_client'
+        ? code : 'other';
+    return error(request, cfg, 502, 'provider_unavailable');
+  }
+  diagnostics.callbackStage = 'identity';
   const identity = await fetch('https://api.github.com/user', {
-    redirect: 'error',
+    redirect: 'manual',
     headers: { Accept: 'application/vnd.github+json', Authorization: `Bearer ${tokenResponse.access_token}`, 'User-Agent': 'personal-site-auth' }
   });
+  if (identity.status >= 300 && identity.status < 400) {
+    throw new Error('Identity endpoint redirect rejected');
+  }
   if (!identity.ok) return error(request, cfg, 502, 'provider_unavailable');
   const user = await providerJson(identity);
   if (!user || typeof user !== 'object' || !('id' in user) ||
@@ -917,6 +1000,7 @@ async function callback(request: Request, env: Env, cfg: Config): Promise<Respon
   }
   const userId = String(user.id);
   const login = user.login;
+  diagnostics.callbackStage = 'authorization';
   if (!cfg.allowedIds.has(userId)) {
     await audit(env, 'login', 'denied', userId);
     const returnTo = safeReturnPath(transaction.return_to, cfg) ?? '/admin/';
@@ -924,6 +1008,7 @@ async function callback(request: Request, env: Env, cfg: Config): Promise<Respon
       cookie(TRANSACTION_COOKIE, '', 0)
     ]);
   }
+  diagnostics.callbackStage = 'handoff';
   const handoff = randomToken();
   const now = Date.now();
   await env.DB.batch([
@@ -934,6 +1019,7 @@ async function callback(request: Request, env: Env, cfg: Config): Promise<Respon
     env.DB.prepare('INSERT INTO audit_logs (id, github_user_id, action, created_at, result) VALUES (?, ?, ?, ?, ?)')
       .bind(crypto.randomUUID(), userId, 'login', now, 'success')
   ]);
+  diagnostics.callbackStage = 'redirect';
   const returnTo = safeReturnPath(transaction.return_to, cfg) ?? '/admin/';
   return redirect(request, cfg, `${cfg.site}${returnTo}#copilot_auth=${handoff}`, [
     cookie(TRANSACTION_COOKIE, '', 0)
@@ -1009,7 +1095,7 @@ function safeReturnPath(value: string | null, cfg: Config): string | null {
   }
 }
 
-async function handle(request: Request, env: Env, cfg: Config): Promise<Response> {
+async function handle(request: Request, env: Env, cfg: Config, diagnostics: RequestDiagnostics): Promise<Response> {
   const url = new URL(request.url);
   const path = url.pathname;
   const routePath = path.length > 1 && path.endsWith('/') ? path.slice(0, -1) : path;
@@ -1028,7 +1114,7 @@ async function handle(request: Request, env: Env, cfg: Config): Promise<Response
     return new Response(null, { status: 204, headers: h });
   }
   if (path === '/auth/github' && request.method === 'GET') return start(request, env, cfg);
-  if (path === '/auth/github/callback' && request.method === 'GET') return callback(request, env, cfg);
+  if (path === '/auth/github/callback' && request.method === 'GET') return callback(request, env, cfg, diagnostics);
   if (path === '/api/auth/exchange' && request.method === 'POST') {
     return exchangeHandoff(request, env, cfg);
   }
@@ -1234,12 +1320,35 @@ async function handle(request: Request, env: Env, cfg: Config): Promise<Response
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const requestId = crypto.randomUUID();
+    const diagnostics: RequestDiagnostics = {};
     try {
-      const response = await handle(request, env, config(env));
+      const response = await handle(request, env, config(env), diagnostics);
       response.headers.set('X-Request-ID', requestId);
+      if (diagnostics.tokenResponseStatus !== undefined) {
+        console.error(
+          `Authentication provider unavailable (${requestId})` +
+          ` token_response_status=${diagnostics.tokenResponseStatus}`
+        );
+      }
+      if (diagnostics.tokenResponseError) {
+        console.error(
+          `Authentication provider unavailable (${requestId})` +
+          ` token_response_error=${diagnostics.tokenResponseError}`
+        );
+      }
       return response;
     } catch {
-      console.error(`Authentication service unavailable (${requestId})`);
+      console.error(
+        `Authentication service unavailable (${requestId})` +
+        (diagnostics.callbackStage ? ` callback_stage=${diagnostics.callbackStage}` : '') +
+        (diagnostics.tokenRequestFailure ? ` token_request_failure=${diagnostics.tokenRequestFailure}` : '') +
+        (diagnostics.tokenRedirect
+          ? ` token_redirect_status=${diagnostics.tokenRedirect.status}` +
+            ` token_redirect_host=${diagnostics.tokenRedirect.host}` +
+            ` token_redirect_same_path=${diagnostics.tokenRedirect.samePath}` +
+            ` token_redirect_https=${diagnostics.tokenRedirect.https}`
+          : '')
+      );
       return new Response(JSON.stringify({ error: 'service_unavailable' }), {
         status: 503,
         headers: {

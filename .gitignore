@@ -6,4 +6,5 @@ npm-debug.log*
 worker/.dev.vars*
 worker/.env*
 worker/wrangler.production.jsonc
+worker/.deploy-*/
 !worker/.dev.vars.example

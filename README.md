@@ -137,6 +137,54 @@ credentials, or deployed Worker URL are present in this repository. The
 placeholders above are not production values; remote migrations and deployment
 must wait until you configure and verify the actual resources.
 
+### Production Worker builds
+
+The static website stays on GitHub Pages; the production Cloudflare Worker is
+the authentication/draft API in `worker/src/index.ts`, not the Astro website.
+Do not use bare `npx wrangler deploy` at the repository root: without an explicit
+config it auto-configures Astro for Cloudflare and rebuilds with a different
+output layout, which breaks static-site validation.
+
+After review and merge, set the existing Worker's production **Deploy command**
+to the following, replacing the account placeholder with its verified account
+ID. Keep **Build command** as `npm run build`, the repository root, and all
+other settings unchanged:
+
+```sh
+npm run deploy:worker -- --account-id VERIFIED_ACCOUNT_ID
+```
+
+The script requires the existing build's `CLOUDFLARE_API_TOKEN` to read Worker
+settings, routing, and deployments. It does not read local credentials or
+secret values. Missing permission stops deployment; do not broaden permissions
+or replace the token automatically. It supports the existing authentication
+Worker's six variables, three secret-name bindings, one D1 binding and two rate
+limits, with no custom routes/domains or tail consumers. Unknown or missing
+settings, bindings, or traffic splitting stop deployment for review.
+
+Non-secret resource/runtime settings are written to a short-lived, Git-ignored
+`worker/.deploy-*/wrangler.json`, then Wrangler compiles the real API entry point
+with auto-configuration disabled. `--keep-vars` preserves runtime variables;
+Wrangler retains existing secrets without retrieving their values. The script
+checks for drift before deployment and compares configuration after deployment,
+without logging raw Wrangler output or runtime values. It never creates a D1
+database, runs migrations, or configures Astro. A detected post-deploy mismatch
+is a release failure requiring inspection, not an automatic rollback.
+
+For read-only compilation validation using the CI token:
+
+```sh
+npm run deploy:worker -- --account-id VERIFIED_ACCOUNT_ID --dry-run
+```
+
+Actual deployment is restricted to Workers Builds on `master`. Before enabling
+the command, verify that the reviewed source includes every fix already running
+in production: deploying an older `master` can regress authentication even when
+the build succeeds. In particular, both GitHub OAuth requests must contain the
+reviewed redirect-handling fixes before replacing the current production code.
+Do not use the Preview or local development config for production, copy another
+worktree's production config, or commit generated production settings.
+
 ### Cloudflare Workers Builds previews
 
 The previously reported Preview command, `npx wrangler preview`, failed because
@@ -160,6 +208,44 @@ Preview Base settings from being inherited. The Preview command is shared by
 all non-production branches, so existing branches that do not contain this
 config must sync it from `master` before they can create previews. This change
 does not address the separate production build failure on `master`.
+
+### Diagnosing OAuth callback failures
+
+The Worker returns a generic `service_unavailable` response for unexpected
+errors. For an exception during the GitHub OAuth callback, the Worker runtime
+log includes the response's `X-Request-ID` and an allowlisted
+`callback_stage`. This identifies the failing stage, not the underlying cause.
+Ordinary provider errors and other expected responses retain their existing
+status codes. A non-success HTTP response from the token endpoint is logged
+separately with the request ID and `token_response_status`, without its body.
+A successful response without a token is recorded only as an allowlisted
+`token_response_error` value.
+The token exchange distinguishes an exception making the request
+(`token_exchange_request`) from reading or parsing its response
+(`token_exchange_response`). Request exceptions also get a best-effort,
+allowlisted `token_request_failure` category; `other` means the cause is
+unknown. Rejected token endpoint redirects additionally record their status,
+an allowlisted host category, and whether their path and scheme match; the
+redirect is never followed or logged in full. Raw exception messages are never
+logged by this application.
+
+Both the token exchange and identity request use `redirect: 'manual'`, supported
+by Cloudflare Workers. Every 3xx response is rejected rather than forwarding
+OAuth credentials to another location; identity failures report only the safe
+callback stage and request ID.
+
+In the Cloudflare dashboard, select the deployed Worker and open its runtime
+logs under **Observability** (enable logs if required). These are separate
+from **Builds** logs. Start a fresh login from the site and find the runtime
+entry matching the response's `X-Request-ID`. Dashboard labels and log
+availability can vary by configuration. Share only the request ID and stage;
+do not share callback URLs, authorization codes, state, cookies, tokens, or
+secrets. This application log excludes those values, but other platform
+request logs or screenshots may contain them.
+
+Deploy diagnostics only after verifying the target Worker, environment, D1
+binding, rate limiters, variables, and secrets. Do not recreate the database or
+overwrite production configuration to troubleshoot a callback.
 
 ### Using the editor to publish
 

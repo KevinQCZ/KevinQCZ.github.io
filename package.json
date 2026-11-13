@@ -8,6 +8,7 @@
   "scripts": {
     "dev": "astro dev",
     "build": "astro build && npm run validate",
+    "deploy:worker": "node scripts/deploy-worker.mjs",
     "preview": "astro preview",
     "check": "astro check && npm run check:worker",
     "check:worker": "tsc -p worker/tsconfig.json --noEmit",
