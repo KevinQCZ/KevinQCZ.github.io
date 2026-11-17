@@ -416,6 +416,28 @@ describe('in-page article editor', () => {
     });
   });
 
+  it('passes the selected upload date range to the attachment library', async () => {
+    const root = createRoot();
+    const fetcher = vi.fn(async (_input: RequestInfo | URL) => Response.json({
+      attachments: [],
+      summary: { total: 0, storage: 0, images: 0, documents: 0, unused: 0 }
+    }));
+    await mountArticleEditorUi(root, 'https://api.example.test', seed, session, fetcher);
+    root.querySelector<HTMLButtonElement>('[data-editor-toggle]')!.click();
+
+    const from = root.querySelector<HTMLInputElement>('[data-library-from]')!;
+    const to = root.querySelector<HTMLInputElement>('[data-library-to]')!;
+    from.value = '2026-03-01';
+    to.value = '2026-03-31';
+    root.querySelector<HTMLButtonElement>('[data-library-toggle]')!.click();
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+
+    const requestUrl = new URL(String(fetcher.mock.calls[0]?.[0]));
+    expect(requestUrl.pathname).toBe('/api/admin/attachments');
+    expect(requestUrl.searchParams.get('from')).toBe('2026-03-01');
+    expect(requestUrl.searchParams.get('to')).toBe('2026-03-31');
+  });
+
   it('keeps edits and reports a clear error when the draft API fails', async () => {
     const root = createRoot();
     const fetcher = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) =>

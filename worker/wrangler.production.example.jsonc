@@ -11,6 +11,9 @@
       "migrations_dir": "migrations"
     }
   ],
+  "r2_buckets": [
+    { "binding": "ATTACHMENTS", "bucket_name": "REPLACE_WITH_R2_BUCKET_NAME" }
+  ],
   "ratelimits": [
     {
       "name": "AUTH_RATE_LIMITER",
@@ -28,6 +31,8 @@
     "API_ORIGIN": "https://REPLACE_WITH_WORKER_HOST.workers.dev",
     "GITHUB_CLIENT_ID": "REPLACE_WITH_GITHUB_OAUTH_CLIENT_ID",
     "ADMIN_GITHUB_IDS": "REPLACE_WITH_VERIFIED_NUMERIC_GITHUB_ID",
+    "MAX_ATTACHMENT_BYTES": "20971520",
+    "MAX_ATTACHMENT_STORAGE_BYTES": "1073741824",
     "GITHUB_APP_ID": "REPLACE_WITH_GITHUB_APP_ID",
     "GITHUB_APP_INSTALLATION_ID": "REPLACE_WITH_REPOSITORY_INSTALLATION_ID"
   }

@@ -11,6 +11,9 @@
       "migrations_dir": "migrations"
     }
   ],
+  "r2_buckets": [
+    { "binding": "ATTACHMENTS", "bucket_name": "local-attachments" }
+  ],
   "ratelimits": [
     { "name": "AUTH_RATE_LIMITER", "namespace_id": "1001", "simple": { "limit": 10, "period": 60 } },
     { "name": "WRITE_RATE_LIMITER", "namespace_id": "1002", "simple": { "limit": 10, "period": 60 } }

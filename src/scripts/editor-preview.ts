@@ -2,9 +2,22 @@ import DOMPurify from 'dompurify';
 import { marked, Renderer } from 'marked';
 
 const allowedTags = [
-  'a', 'blockquote', 'br', 'code', 'del', 'em', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+  'a', 'blockquote', 'br', 'code', 'del', 'em', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'span',
   'hr', 'li', 'ol', 'p', 'pre', 'strong', 'table', 'tbody', 'td', 'th', 'thead', 'tr', 'ul'
 ];
+const attachmentUrl = /^attachment:([a-f0-9-]{36})$/i;
+
+function isAttachmentLink(value: string | null | undefined, apiOrigin: string): boolean {
+  if (!value || !apiOrigin) return false;
+  try {
+    const url = new URL(value, document.baseURI);
+    return url.origin === apiOrigin &&
+      /^\/api\/attachments\/[a-f0-9-]{36}\/(?:preview|download)$/.test(url.pathname) &&
+      /^a_[A-Za-z0-9_-]{22}$/.test(url.searchParams.get('articleId') || '');
+  } catch {
+    return false;
+  }
+}
 
 function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (character) => ({
@@ -39,11 +52,23 @@ export function renderSafeMarkdown(
   source: string,
   preview: HTMLElement,
   coverUrl: string | null,
-  title: string
+  title: string,
+  apiOrigin = ''
 ): void {
   const renderer = new Renderer();
   renderer.html = ({ text }) => `<pre><code>${escapeHtml(text)}</code></pre>`;
-  renderer.image = ({ text }) => `<span class="preview-image-placeholder">[Image: ${escapeHtml(text)}]</span>`;
+  renderer.image = ({ href, text }) => {
+    const attachment = attachmentUrl.exec(href || '');
+    return attachment || isAttachmentLink(href, apiOrigin)
+      ? `<span class="preview-attachment">[Attachment image: ${escapeHtml(text || 'Image')}]</span>`
+      : `<span class="preview-image-placeholder">[Image: ${escapeHtml(text)}]</span>`;
+  };
+  renderer.link = ({ href, text }) => {
+    if (attachmentUrl.test(href || '') || isAttachmentLink(href, apiOrigin)) {
+      return `<span class="preview-attachment">[Attachment: ${text}]</span>`;
+    }
+    return `<a href="${escapeHtml(href || '')}">${text}</a>`;
+  };
   const html = marked.parse(source, {
     async: false,
     breaks: false,

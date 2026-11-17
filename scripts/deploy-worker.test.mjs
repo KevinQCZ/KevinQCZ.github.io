@@ -17,11 +17,13 @@ const fixture = () => ({
   settings: {
     bindings: [
       ...['ADMIN_GITHUB_IDS', 'API_ORIGIN', 'GITHUB_APP_ID',
-        'GITHUB_APP_INSTALLATION_ID', 'GITHUB_CLIENT_ID', 'SITE_ORIGIN']
+        'GITHUB_APP_INSTALLATION_ID', 'GITHUB_CLIENT_ID', 'MAX_ATTACHMENT_BYTES',
+        'MAX_ATTACHMENT_STORAGE_BYTES', 'SITE_ORIGIN']
         .map((name) => ({ name, type: 'plain_text', text: `test-only-${name}` })),
       ...['CSRF_SECRET', 'GITHUB_APP_PRIVATE_KEY', 'GITHUB_CLIENT_SECRET']
         .map((name) => ({ name, type: 'secret_text' })),
       { name: 'DB', type: 'd1', id: databaseId, database_id: databaseId },
+      { name: 'ATTACHMENTS', type: 'r2_bucket', bucket_name: 'test-attachments' },
       ...['AUTH_RATE_LIMITER', 'WRITE_RATE_LIMITER'].map((name, index) => ({
         name, type: 'ratelimit', namespace_id: `${index + 100}`,
         simple: { limit: 10, period: 60 }
@@ -51,6 +53,7 @@ test('maps existing resources and runtime settings without serializing variables
   assert.equal(config.name, 'kevinqcz-github-io');
   assert.ok(config.main.endsWith(path.join('worker', 'src', 'index.ts')));
   assert.deepEqual(config.d1_databases, [{ binding: 'DB', database_id: databaseId }]);
+  assert.deepEqual(config.r2_buckets, [{ binding: 'ATTACHMENTS', bucket_name: 'test-attachments' }]);
   assert.deepEqual(config.ratelimits, state.settings.bindings
     .filter((binding) => binding.type === 'ratelimit')
     .map(({ name, namespace_id, simple }) => ({ name, namespace_id, simple })));
@@ -70,6 +73,7 @@ test('rejects unknown, missing, duplicate or mismatched bindings and unsupported
     (state) => state.settings.bindings.push(state.settings.bindings[0]),
     (state) => { state.settings.bindings.find((binding) => binding.name === 'DB').id = version; },
     (state) => { state.settings.bindings.find((binding) => binding.type === 'secret_text').text = 'must-not-log'; },
+    (state) => { state.settings.bindings.find((binding) => binding.type === 'r2_bucket').bucket_name = ''; },
     (state) => { state.settings.placement = { mode: 'smart' }; },
     (state) => { state.settings.observability.unknown_option = true; },
     (state) => { state.settings.unsafe = { enabled: true }; },

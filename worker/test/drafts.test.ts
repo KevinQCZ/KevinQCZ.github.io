@@ -1,6 +1,7 @@
 import { env, applyD1Migrations } from 'cloudflare:test';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import worker from '../src/index';
+import { publishedArticleId } from '../src/github';
 
 const config = {
   SITE_ORIGIN: 'https://site.example.test',
@@ -139,12 +140,17 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   await env.DB.batch([
+    env.DB.prepare('DELETE FROM article_attachments'),
+    env.DB.prepare('DELETE FROM attachment_revisions'),
+    env.DB.prepare('DELETE FROM attachments'),
     env.DB.prepare('DELETE FROM admin_sessions'),
     env.DB.prepare('DELETE FROM oauth_transactions'),
     env.DB.prepare('DELETE FROM oauth_handoffs'),
     env.DB.prepare('DELETE FROM audit_logs'),
     env.DB.prepare('DELETE FROM article_drafts')
   ]);
+  const uploaded = await env.ATTACHMENTS.list();
+  await Promise.all(uploaded.objects.map((object) => env.ATTACHMENTS.delete(object.key)));
   limiter.limit.mockReset().mockResolvedValue({ success: true });
   githubRequests = [];
   githubEnabled = false;
@@ -272,6 +278,7 @@ describe('admin article source and draft management', () => {
       GITHUB_APP_INSTALLATION_ID: '',
       GITHUB_APP_PRIVATE_KEY: ''
     });
+
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({
       articles: [],
@@ -596,5 +603,172 @@ describe('admin article source and draft management', () => {
     expect((await invoke('/api/admin/drafts', {
       method: 'POST', headers, body: JSON.stringify(payload)
     }, gitHubAppKeyOverrides())).status).toBe(409);
+  });
+});
+
+describe('admin attachment storage and public reading', () => {
+  it('rejects unauthenticated, malformed, and MIME-spoofed uploads', async () => {
+    const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const uploadHeaders = {
+      Origin: config.SITE_ORIGIN,
+      'Content-Type': 'application/octet-stream',
+      'X-Attachment-Name': encodeURIComponent('image.png'),
+      'X-Attachment-Type': 'image/png'
+    };
+    expect((await invoke('/api/admin/attachments/upload', {
+      method: 'POST', headers: uploadHeaders, body: bytes.buffer
+    })).status).toBe(401);
+
+    const { session, csrfToken } = await login();
+    const spoofedFile = await invoke('/api/admin/attachments/upload', {
+      method: 'POST',
+      headers: { ...uploadHeaders, Cookie: session, 'X-CSRF-Token': csrfToken },
+      body: new TextEncoder().encode('<script>alert(1)</script>').buffer
+    });
+    expect(spoofedFile.status).toBe(415);
+    const invalidExtension = await invoke('/api/admin/attachments/upload', {
+      method: 'POST',
+      headers: {
+        ...uploadHeaders,
+        Cookie: session,
+        'X-CSRF-Token': csrfToken,
+        'X-Attachment-Name': 'run.exe'
+      },
+      body: bytes.buffer
+    });
+    expect(invalidExtension.status).toBe(400);
+  });
+
+  it('stores validated bytes privately and allows public reads only for a published article reference', async () => {
+    const { session, csrfToken } = await login();
+    const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]);
+    const uploaded = await invoke('/api/admin/attachments/upload', {
+      method: 'POST',
+      headers: {
+        Cookie: session,
+        Origin: config.SITE_ORIGIN,
+        'Content-Type': 'application/octet-stream',
+        'X-Attachment-Name': encodeURIComponent('evidence.png'),
+        'X-Attachment-Type': 'image/png',
+        'X-CSRF-Token': csrfToken
+      },
+      body: bytes.buffer
+    });
+    expect(uploaded.status).toBe(201);
+    const response = await uploaded.json() as { attachment: { id: string; file_size: number } };
+    expect(response.attachment.id).toMatch(/^[a-f0-9-]{36}$/i);
+    expect(response.attachment.file_size).toBe(bytes.byteLength);
+    expect('r2_object_key' in response.attachment).toBe(false);
+    const stored = await env.DB.prepare('SELECT r2_object_key FROM attachments WHERE id = ?')
+      .bind(response.attachment.id).first<{ r2_object_key: string }>();
+    expect(stored?.r2_object_key).toBeTruthy();
+
+    const articleId = await publishedArticleId(articlePath);
+    const reference = `![evidence.png](https://api.example.test/api/attachments/${response.attachment.id}/preview?articleId=${articleId})`;
+    githubEnabled = true;
+    const savedDraft = await invoke('/api/admin/drafts', {
+      method: 'POST',
+      headers: {
+        Cookie: session,
+        Origin: config.SITE_ORIGIN,
+        'Content-Type': 'application/json',
+        'X-CSRF-Token': csrfToken
+      },
+      body: JSON.stringify({
+        articleId,
+        permalink: '2026/01/01/existing-article',
+        sourceFormat: 'mdx',
+        title: 'Existing article',
+        description: 'A published article used by local tests.',
+        publishedAt: '2026-01-01',
+        categories: ['Engineering'],
+        tags: ['Astro'],
+        coverUrl: null,
+        body: `# Draft source\n\n${reference}`,
+        expectedRevision: null
+      })
+    });
+    expect(savedDraft.status).toBe(201);
+
+    const unpublished = await invoke(`/api/attachments/${response.attachment.id}/preview?articleId=${articleId}`);
+    expect(unpublished.status).toBe(403);
+
+    currentArticleSource = `${articleSource}\n${reference}\n`;
+    const published = await invoke(`/api/attachments/${response.attachment.id}/preview?articleId=${articleId}`);
+    expect(published.status).toBe(200);
+    expect(published.headers.get('Content-Type')).toBe('image/png');
+    expect(published.headers.get('Content-Disposition')).toMatch(/^inline;/);
+    expect(new Uint8Array(await published.arrayBuffer())).toEqual(bytes);
+
+    const inUse = await invoke(`/api/admin/attachments/${response.attachment.id}`, {
+      method: 'DELETE',
+      headers: { Cookie: session, Origin: config.SITE_ORIGIN, 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }
+    });
+    expect(inUse.status).toBe(409);
+  });
+
+  it('keeps published attachment access while an unpublished draft removes its reference', async () => {
+    const { session, csrfToken } = await login();
+    const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]);
+    const uploaded = await invoke('/api/admin/attachments/upload', {
+      method: 'POST',
+      headers: {
+        Cookie: session,
+        Origin: config.SITE_ORIGIN,
+        'Content-Type': 'application/octet-stream',
+        'X-Attachment-Name': encodeURIComponent('published.png'),
+        'X-Attachment-Type': 'image/png',
+        'X-CSRF-Token': csrfToken
+      },
+      body: bytes.buffer
+    });
+    const { attachment } = await uploaded.json() as { attachment: { id: string } };
+    const articleId = await publishedArticleId(articlePath);
+    const reference = `![published.png](https://api.example.test/api/attachments/${attachment.id}/preview?articleId=${articleId})`;
+    currentArticleSource = `${articleSource}\n${reference}\n`;
+    githubEnabled = true;
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO article_attachments
+         (article_id, attachment_id, display_order, inserted_at, created_at)
+         VALUES (?, ?, 0, ?, ?)`
+      ).bind(articleId, attachment.id, Date.now(), Date.now()),
+      env.DB.prepare("UPDATE attachments SET visibility = 'published' WHERE id = ?").bind(attachment.id)
+    ]);
+
+    const initiallyPublished = await invoke(`/api/attachments/${attachment.id}/preview?articleId=${articleId}`);
+    expect(initiallyPublished.status).toBe(200);
+    await initiallyPublished.arrayBuffer();
+
+    const savedDraft = await invoke('/api/admin/drafts', {
+      method: 'POST',
+      headers: {
+        Cookie: session,
+        Origin: config.SITE_ORIGIN,
+        'Content-Type': 'application/json',
+        'X-CSRF-Token': csrfToken
+      },
+      body: JSON.stringify({
+        articleId,
+        permalink: '2026/01/01/existing-article',
+        sourceFormat: 'mdx',
+        title: 'Edited article',
+        description: 'A draft that removes the image.',
+        publishedAt: '2026-01-01',
+        categories: ['Engineering'],
+        tags: ['Astro'],
+        coverUrl: null,
+        body: '# Draft without the image',
+        expectedRevision: null
+      })
+    });
+    expect(savedDraft.status).toBe(201);
+    const relationship = await env.DB.prepare(
+      'SELECT 1 FROM article_attachments WHERE article_id = ? AND attachment_id = ?'
+    ).bind(articleId, attachment.id).first();
+    expect(relationship).not.toBeNull();
+    const stillPublished = await invoke(`/api/attachments/${attachment.id}/preview?articleId=${articleId}`);
+    expect(stillPublished.status).toBe(200);
+    await stillPublished.arrayBuffer();
   });
 });

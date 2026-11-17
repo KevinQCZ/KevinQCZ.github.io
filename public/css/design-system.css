@@ -703,6 +703,38 @@ a {
   height: auto;
 }
 
+.article-body a[href*="/api/attachments/"][href*="/download"] {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: var(--surface);
+  padding: 8px 12px;
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.article-body a[href*="/api/attachments/"][href*="/download"]::before {
+  content: "FILE";
+  flex: 0 0 auto;
+  border-radius: 4px;
+  background: var(--surface-soft);
+  padding: 2px 4px;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.article-body img[src*="/api/attachments/"][src*="/preview"] {
+  display: block;
+  max-height: 640px;
+  border-radius: var(--radius-control);
+  object-fit: contain;
+}
+
 .article-body table {
   display: block;
   max-width: 100%;

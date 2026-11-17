@@ -471,6 +471,16 @@ describe('authorization, CSRF, CORS and failure behavior', () => {
       'Access-Control-Request-Headers': 'authorization,content-type,x-csrf-token'
     } });
     expect(preflight.status).toBe(204);
+    const attachmentRename = await invoke('/api/admin/attachments/00000000-0000-4000-8000-000000000000', {
+      method: 'OPTIONS',
+      headers: {
+        Origin: config.SITE_ORIGIN,
+        'Access-Control-Request-Method': 'PATCH',
+        'Access-Control-Request-Headers': 'authorization,content-type,x-csrf-token'
+      }
+    });
+    expect(attachmentRename.status).toBe(204);
+    expect(attachmentRename.headers.get('Access-Control-Allow-Methods')).toContain('PATCH');
     expect((await invoke('/api/logout', { method: 'OPTIONS', headers: {
       Origin: 'https://evil.test', 'Access-Control-Request-Method': 'POST'
     } })).headers.has('Access-Control-Allow-Origin')).toBe(false);

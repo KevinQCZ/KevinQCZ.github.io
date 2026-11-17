@@ -6,6 +6,46 @@ import '../styles/article-editor.css';
 
 type EditorContent = ArticleContent;
 
+interface AttachmentRecord {
+  id: string;
+  original_filename: string;
+  display_filename: string;
+  file_extension: string;
+  detected_mime_type: string;
+  file_size: number;
+  upload_status: 'active';
+  visibility: 'private' | 'published';
+  created_at: number;
+  articleCount?: number;
+}
+
+function isAttachmentRecord(value: unknown): value is AttachmentRecord {
+  if (!value || typeof value !== 'object') return false;
+  const record = value as Partial<AttachmentRecord>;
+  return typeof record.id === 'string' && /^[a-f0-9-]{36}$/i.test(record.id) &&
+    typeof record.original_filename === 'string' && typeof record.display_filename === 'string' &&
+    typeof record.file_extension === 'string' && typeof record.detected_mime_type === 'string' &&
+    Number.isSafeInteger(record.file_size) && record.file_size! > 0 &&
+    record.upload_status === 'active' && ['private', 'published'].includes(String(record.visibility)) &&
+    typeof record.created_at === 'number';
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ['KB', 'MB', 'GB'];
+  let value = bytes / 1024;
+  let unit = units[0];
+  for (let index = 1; value >= 1024 && index < units.length; index += 1) {
+    value /= 1024;
+    unit = units[index];
+  }
+  return `${value.toFixed(value >= 10 ? 0 : 1)} ${unit}`;
+}
+
+function markdownLabel(value: string): string {
+  return value.replaceAll('\\', '\\\\').replaceAll(']', '\\]');
+}
+
 function isArticleDraft(value: unknown, permalink: string): value is ArticleDraft {
   if (!value || typeof value !== 'object') return false;
   const draft = value as Partial<ArticleDraft>;
@@ -87,6 +127,60 @@ function editorMarkup(): string {
         </div>
       </div>
       <a data-pull-request hidden target="_blank" rel="noopener noreferrer"></a>
+      <section class="article-attachments" aria-label="Article attachments">
+        <div class="article-attachments-toolbar" role="toolbar" aria-label="Attachment actions">
+          <button type="button" class="button-secondary" data-insert-image>Insert image</button>
+          <button type="button" class="button-secondary" data-insert-file>Insert file</button>
+          <button type="button" class="button-secondary" data-library-toggle aria-expanded="false">Attachment library</button>
+          <button type="button" class="button-secondary" data-cancel-upload hidden>Cancel upload</button>
+          <button type="button" class="button-secondary" data-retry-upload hidden>Retry failed uploads</button>
+          <input type="file" data-file-picker multiple hidden />
+          <input type="file" data-replace-picker hidden />
+        </div>
+        <p data-attachment-status role="status" aria-live="polite"></p>
+        <section class="attachment-library" data-attachment-library hidden aria-label="Attachment library">
+          <div class="attachment-library-controls">
+            <label>Search attachments <input data-library-search type="search" maxlength="100" /></label>
+            <label>File type
+              <select data-library-type>
+                <option value="all">All types</option>
+                <option value="image">Images</option>
+                <option value="document">Documents</option>
+                <option value="pdf">PDF</option>
+                <option value="audio">Audio</option>
+                <option value="video">Video</option>
+              </select>
+            </label>
+            <label>Uploaded from <input data-library-from type="date" /></label>
+            <label>Uploaded through <input data-library-to type="date" /></label>
+            <label>Sort
+              <select data-library-sort>
+                <option value="uploaded">Newest</option>
+                <option value="name">Filename</option>
+                <option value="size">File size</option>
+              </select>
+            </label>
+          </div>
+          <p data-library-summary></p>
+          <ul data-library-list></ul>
+        </section>
+      </section>
+      <dialog class="attachment-viewer" data-attachment-viewer aria-label="Attachment viewer">
+        <header>
+          <div><h2 data-viewer-title></h2><p data-viewer-details></p></div>
+          <div>
+            <button type="button" class="button-secondary" data-viewer-previous aria-label="Previous attachment">Previous</button>
+            <button type="button" class="button-secondary" data-viewer-next aria-label="Next attachment">Next</button>
+            <button type="button" class="button-secondary" data-viewer-zoom-out aria-label="Zoom out" hidden>−</button>
+            <button type="button" class="button-secondary" data-viewer-zoom-reset aria-label="Reset zoom" hidden>100%</button>
+            <button type="button" class="button-secondary" data-viewer-zoom-in aria-label="Zoom in" hidden>+</button>
+            <button type="button" class="button-secondary" data-viewer-fullscreen>Fullscreen</button>
+            <button type="button" class="button-secondary" data-viewer-download>Download</button>
+            <button type="button" class="button-secondary" data-viewer-close>Close</button>
+          </div>
+        </header>
+        <div class="attachment-viewer-content" data-viewer-content></div>
+      </dialog>
       <div class="article-editor-tabs" role="tablist" aria-label="Editor view">
         <button type="button" role="tab" id="editor-tab" aria-controls="editor-tabpanel" aria-selected="true" data-tab="editor">Editor</button>
         <button type="button" role="tab" id="preview-tab" aria-controls="preview-tabpanel" aria-selected="false" data-tab="preview" tabindex="-1">Preview</button>
@@ -157,6 +251,31 @@ export async function mountArticleEditorUi(
   const previewMeta = root.querySelector<HTMLElement>('[data-preview-meta]')!;
   const editorHelp = root.querySelector<HTMLElement>('#editor-help')!;
   const previewPane = root.querySelector<HTMLElement>('[data-preview-pane]')!;
+  const filePicker = root.querySelector<HTMLInputElement>('[data-file-picker]')!;
+  const replacePicker = root.querySelector<HTMLInputElement>('[data-replace-picker]')!;
+  const attachmentStatus = root.querySelector<HTMLElement>('[data-attachment-status]')!;
+  const cancelUploadButton = root.querySelector<HTMLButtonElement>('[data-cancel-upload]')!;
+  const retryUploadButton = root.querySelector<HTMLButtonElement>('[data-retry-upload]')!;
+  const libraryToggle = root.querySelector<HTMLButtonElement>('[data-library-toggle]')!;
+  const attachmentLibrary = root.querySelector<HTMLElement>('[data-attachment-library]')!;
+  const librarySearch = root.querySelector<HTMLInputElement>('[data-library-search]')!;
+  const libraryType = root.querySelector<HTMLSelectElement>('[data-library-type]')!;
+  const libraryFrom = root.querySelector<HTMLInputElement>('[data-library-from]')!;
+  const libraryTo = root.querySelector<HTMLInputElement>('[data-library-to]')!;
+  const librarySort = root.querySelector<HTMLSelectElement>('[data-library-sort]')!;
+  const librarySummary = root.querySelector<HTMLElement>('[data-library-summary]')!;
+  const libraryList = root.querySelector<HTMLUListElement>('[data-library-list]')!;
+  const viewer = root.querySelector<HTMLDialogElement>('[data-attachment-viewer]')!;
+  const viewerTitle = root.querySelector<HTMLElement>('[data-viewer-title]')!;
+  const viewerDetails = root.querySelector<HTMLElement>('[data-viewer-details]')!;
+  const viewerContent = root.querySelector<HTMLElement>('[data-viewer-content]')!;
+  const viewerDownload = root.querySelector<HTMLButtonElement>('[data-viewer-download]')!;
+  const viewerPrevious = root.querySelector<HTMLButtonElement>('[data-viewer-previous]')!;
+  const viewerNext = root.querySelector<HTMLButtonElement>('[data-viewer-next]')!;
+  const viewerZoomOut = root.querySelector<HTMLButtonElement>('[data-viewer-zoom-out]')!;
+  const viewerZoomReset = root.querySelector<HTMLButtonElement>('[data-viewer-zoom-reset]')!;
+  const viewerZoomIn = root.querySelector<HTMLButtonElement>('[data-viewer-zoom-in]')!;
+  const viewerFullscreen = root.querySelector<HTMLButtonElement>('[data-viewer-fullscreen]')!;
   const workspace = root.querySelector<HTMLElement>('[data-active-tab]')!;
   const coverError = root.querySelector<HTMLElement>('[data-cover-error]')!;
   const permalinkInput = root.querySelector<HTMLInputElement>('[data-permalink-input]')!;
@@ -186,6 +305,14 @@ export async function mountArticleEditorUi(
   let saving = false;
   let publicationState = initialDraft?.publicationState ?? 'NOT_SUBMITTED';
   let activeTab: 'editor' | 'preview' = 'editor';
+  let uploadController: AbortController | null = null;
+  let failedUploads: File[] = [];
+  let libraryRecords: AttachmentRecord[] = [];
+  let activeViewerRecord: AttachmentRecord | null = null;
+  let viewerObjectUrl: string | null = null;
+  let viewerImage: HTMLImageElement | null = null;
+  let viewerZoom = 1;
+  let viewerLoadId = 0;
 
   const setStatus = (message: string, isError = false) => {
     status.textContent = message;
@@ -215,6 +342,369 @@ export async function mountArticleEditorUi(
     body: bodyValue()
   });
 
+  const currentArticleId = async (): Promise<string> => {
+    const slug = currentContent().permalink.split('/').at(-1) || 'new-article';
+    const articlePath = seed.articlePath || `src/content/articles/${slug}.${seed.sourceFormat}`;
+    const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(articlePath)));
+    let binary = '';
+    for (const byte of digest) binary += String.fromCharCode(byte);
+    const hash = btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    return `a_${hash.slice(0, 22)}`;
+  };
+
+  const insertAttachmentReference = async (record: AttachmentRecord) => {
+    const image = ['jpg', 'jpeg', 'png', 'webp', 'gif'].includes(record.file_extension);
+    const label = markdownLabel(record.display_filename);
+    const articleId = await currentArticleId();
+    const destination = new URL(
+      `/api/attachments/${record.id}/${image ? 'preview' : 'download'}`,
+      apiOrigin
+    );
+    destination.searchParams.set('articleId', articleId);
+    const reference = `${image ? '!' : ''}[${label}](${destination.href})`;
+    if (editor) {
+      const { from, to } = editor.state.selection.main;
+      editor.dispatch({
+        changes: { from, to, insert: reference },
+        selection: { anchor: from + reference.length },
+        scrollIntoView: true
+      });
+      editor.focus();
+    } else {
+      const from = fallback.selectionStart;
+      const to = fallback.selectionEnd;
+      fallback.setRangeText(reference, from, to, 'end');
+      fallback.focus();
+      refreshDirty();
+    }
+    attachmentStatus.textContent = `Inserted ${record.display_filename}. Save the draft to retain the attachment reference.`;
+  };
+
+  const uploadOne = async (file: File, replaceId?: string): Promise<AttachmentRecord> => {
+    const endpoint = replaceId
+      ? `/api/admin/attachments/${encodeURIComponent(replaceId)}/replace`
+      : '/api/admin/attachments/upload';
+    const response = await adminFetch(apiOrigin, endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'X-CSRF-Token': session.csrfToken,
+        'X-Attachment-Name': encodeURIComponent(file.name),
+        'X-Attachment-Type': file.type
+      },
+      body: file,
+      ...(uploadController ? { signal: uploadController.signal } : {})
+    }, fetcher, session);
+    if (!response.ok) {
+      const result = await response.json().catch(() => null) as { error?: unknown } | null;
+      throw new Error(typeof result?.error === 'string' ? result.error : 'upload_failed');
+    }
+    const result: unknown = await response.json();
+    if (!result || typeof result !== 'object' ||
+        !('attachment' in result) || !isAttachmentRecord(result.attachment)) {
+      throw new Error('invalid_attachment_response');
+    }
+    return result.attachment;
+  };
+
+  const uploadFiles = async (files: File[], replaceId?: string) => {
+    if (!files.length || uploadController) return;
+    uploadController = new AbortController();
+    cancelUploadButton.hidden = false;
+    retryUploadButton.hidden = true;
+    failedUploads = [];
+    for (let index = 0; index < files.length; index += 1) {
+      const file = files[index];
+      if (!file) continue;
+      attachmentStatus.textContent = `Uploading ${index + 1} of ${files.length}: ${file.name}`;
+      try {
+        const record = await uploadOne(file, replaceId);
+        if (replaceId) {
+          attachmentStatus.textContent = `${record.display_filename} was replaced. Previous file version retained for recovery.`;
+          await refreshLibrary();
+        } else {
+          await insertAttachmentReference(record);
+        }
+      } catch (cause) {
+        failedUploads = files.slice(index);
+        if (cause instanceof DOMException && cause.name === 'AbortError') {
+          attachmentStatus.textContent = `Upload cancelled. ${failedUploads.length} file(s) can be retried.`;
+        } else {
+          const reason = cause instanceof Error ? cause.message : 'upload_failed';
+          attachmentStatus.textContent = `Upload failed for ${file.name} (${reason}). Your article edits are unchanged.`;
+        }
+        retryUploadButton.hidden = failedUploads.length === 0;
+        break;
+      }
+    }
+    if (!failedUploads.length && !replaceId) {
+      attachmentStatus.textContent = `${files.length} attachment(s) uploaded and inserted. Save the draft to keep the references.`;
+      await refreshLibrary();
+    }
+    uploadController = null;
+    cancelUploadButton.hidden = true;
+  };
+
+  const safeLibraryResponse = (value: unknown): value is { attachments: AttachmentRecord[]; summary: {
+    total: number; storage: number; images: number; documents: number; unused: number;
+  } } => {
+    if (!value || typeof value !== 'object') return false;
+    const result = value as { attachments?: unknown; summary?: Record<string, unknown> };
+    return Array.isArray(result.attachments) && result.attachments.every(isAttachmentRecord) &&
+      !!result.summary && ['total', 'storage', 'images', 'documents', 'unused']
+        .every((key) => Number.isSafeInteger(result.summary![key]));
+  };
+
+  const refreshLibrary = async () => {
+    libraryList.replaceChildren();
+    librarySummary.textContent = 'Loading attachments…';
+    const params = new URLSearchParams({
+      search: librarySearch.value.trim(),
+      type: libraryType.value,
+      sort: librarySort.value
+    });
+    if (libraryFrom.value) params.set('from', libraryFrom.value);
+    if (libraryTo.value) params.set('to', libraryTo.value);
+    if (libraryFrom.value && libraryTo.value && libraryFrom.value > libraryTo.value) {
+      librarySummary.textContent = 'The start date must be on or before the end date.';
+      return;
+    }
+    try {
+      const response = await adminFetch(apiOrigin, `/api/admin/attachments?${params}`, {}, fetcher, session);
+      if (!response.ok) throw new Error('attachment_library_unavailable');
+      const result: unknown = await response.json();
+      if (!safeLibraryResponse(result)) throw new Error('invalid_attachment_library');
+      libraryRecords = result.attachments;
+      const summary = result.summary;
+      librarySummary.textContent =
+        `${summary.total} attachments · ${formatFileSize(summary.storage)} · ${summary.images} images · ` +
+        `${summary.documents} documents · ${summary.unused} unused`;
+      for (const record of libraryRecords) {
+        const item = document.createElement('li');
+        item.className = 'attachment-library-item';
+        const details = document.createElement('div');
+        details.className = 'attachment-library-details';
+        const name = document.createElement('strong');
+        name.textContent = record.display_filename;
+        const metadata = document.createElement('span');
+        metadata.textContent = `${record.file_extension.toUpperCase()} · ${formatFileSize(record.file_size)} · ` +
+          `${new Date(record.created_at).toLocaleString()} · ${record.visibility}`;
+        details.append(name, metadata);
+        const actions = document.createElement('div');
+        actions.className = 'attachment-library-actions';
+        const addButton = document.createElement('button');
+        addButton.type = 'button';
+        addButton.className = 'button-secondary';
+        addButton.textContent = 'Insert';
+        addButton.addEventListener('click', () => void insertAttachmentReference(record));
+        const previewButton = document.createElement('button');
+        previewButton.type = 'button';
+        previewButton.className = 'button-secondary';
+        previewButton.textContent = 'Preview';
+        previewButton.addEventListener('click', () => void openViewer(record));
+        const renameButton = document.createElement('button');
+        renameButton.type = 'button';
+        renameButton.className = 'button-secondary';
+        renameButton.textContent = 'Rename';
+        renameButton.addEventListener('click', () => void renameRecord(record));
+        const replaceButton = document.createElement('button');
+        replaceButton.type = 'button';
+        replaceButton.className = 'button-secondary';
+        replaceButton.textContent = 'Replace';
+        replaceButton.addEventListener('click', () => {
+          replacePicker.dataset.attachmentId = record.id;
+          replacePicker.value = '';
+          replacePicker.click();
+        });
+        const copyButton = document.createElement('button');
+        copyButton.type = 'button';
+        copyButton.className = 'button-secondary';
+        copyButton.textContent = 'Copy link';
+        copyButton.addEventListener('click', () => void copyAttachmentLink(record));
+        const deleteButton = document.createElement('button');
+        deleteButton.type = 'button';
+        deleteButton.className = 'button-secondary';
+        deleteButton.textContent = 'Delete';
+        deleteButton.addEventListener('click', () => void removeRecord(record));
+        actions.append(addButton, previewButton, renameButton, replaceButton, copyButton, deleteButton);
+        item.append(details, actions);
+        libraryList.append(item);
+      }
+      if (!libraryRecords.length) {
+        const empty = document.createElement('li');
+        empty.textContent = 'No attachments match this search.';
+        libraryList.append(empty);
+      }
+    } catch (cause) {
+      librarySummary.textContent = cause instanceof Error ? cause.message : 'Attachment library unavailable.';
+    }
+  };
+
+  const showViewerMessage = (message: string) => {
+    const text = document.createElement('p');
+    text.textContent = message;
+    viewerContent.replaceChildren(text);
+  };
+
+  const attachmentRead = async (record: AttachmentRecord, mode: 'preview' | 'download') =>
+    adminFetch(apiOrigin, `/api/attachments/${encodeURIComponent(record.id)}/${mode}`, {}, fetcher, session);
+
+  const updateViewerControls = () => {
+    const index = libraryRecords.findIndex((record) => record.id === activeViewerRecord?.id);
+    viewerPrevious.disabled = index <= 0;
+    viewerNext.disabled = index < 0 || index >= libraryRecords.length - 1;
+    for (const control of [viewerZoomOut, viewerZoomReset, viewerZoomIn]) control.hidden = !viewerImage;
+    viewerZoomOut.disabled = viewerZoom <= 0.25;
+    viewerZoomIn.disabled = viewerZoom >= 4;
+    viewerZoomReset.textContent = `${Math.round(viewerZoom * 100)}%`;
+  };
+
+  const setViewerZoom = (value: number) => {
+    viewerZoom = Math.min(4, Math.max(0.25, value));
+    if (viewerImage) viewerImage.style.transform = `scale(${viewerZoom})`;
+    updateViewerControls();
+  };
+
+  const openViewer = async (record: AttachmentRecord) => {
+    const loadId = ++viewerLoadId;
+    activeViewerRecord = record;
+    viewerImage = null;
+    setViewerZoom(1);
+    viewerTitle.textContent = record.display_filename;
+    viewerDetails.textContent = `${record.file_extension.toUpperCase()} · ${formatFileSize(record.file_size)}`;
+    viewerContent.replaceChildren();
+    if (viewerObjectUrl) URL.revokeObjectURL(viewerObjectUrl);
+    viewerObjectUrl = null;
+    updateViewerControls();
+    if (!viewer.open) viewer.showModal();
+    try {
+      const response = await attachmentRead(record, 'preview');
+      if (!response.ok) throw new Error('Attachment preview is unavailable.');
+      const blob = await response.blob();
+      if (loadId !== viewerLoadId || !viewer.open) return;
+      if (viewerObjectUrl) URL.revokeObjectURL(viewerObjectUrl);
+      viewerObjectUrl = URL.createObjectURL(blob);
+      const mime = response.headers.get('Content-Type') || '';
+      if (mime.startsWith('image/') && mime !== 'image/svg+xml') {
+        const image = document.createElement('img');
+        image.src = viewerObjectUrl;
+        image.alt = record.display_filename;
+        viewerImage = image;
+        setViewerZoom(1);
+        viewerContent.replaceChildren(image);
+      } else if (mime === 'application/pdf') {
+        const frame = document.createElement('iframe');
+        frame.src = viewerObjectUrl;
+        frame.title = `PDF preview: ${record.display_filename}`;
+        frame.referrerPolicy = 'no-referrer';
+        viewerContent.replaceChildren(frame);
+      } else if (['text/plain', 'text/markdown'].includes(mime)) {
+        const content = document.createElement('pre');
+        content.textContent = await blob.text();
+        viewerContent.replaceChildren(content);
+      } else if (mime === 'text/csv') {
+        renderCsv(await blob.text(), viewerContent);
+      } else if (mime.startsWith('audio/')) {
+        const audio = document.createElement('audio');
+        audio.controls = true;
+        audio.src = viewerObjectUrl;
+        viewerContent.replaceChildren(audio);
+      } else if (mime.startsWith('video/')) {
+        const video = document.createElement('video');
+        video.controls = true;
+        video.src = viewerObjectUrl;
+        viewerContent.replaceChildren(video);
+      } else {
+        showViewerMessage('This file type is not previewed in the browser. Download the original to open it safely.');
+      }
+      updateViewerControls();
+    } catch (cause) {
+      if (loadId === viewerLoadId && viewer.open) {
+        showViewerMessage(cause instanceof Error ? cause.message : 'Attachment preview is unavailable.');
+      }
+    }
+  };
+
+  const moveViewer = (offset: -1 | 1) => {
+    const index = libraryRecords.findIndex((record) => record.id === activeViewerRecord?.id);
+    const next = libraryRecords[index + offset];
+    if (next) void openViewer(next);
+  };
+
+  const renderCsv = (source: string, target: HTMLElement) => {
+    const table = document.createElement('table');
+    for (const line of source.split(/\r?\n/).slice(0, 500)) {
+      const row = document.createElement('tr');
+      for (const cell of line.split(',').slice(0, 30)) {
+        const element = document.createElement('td');
+        element.textContent = cell.replace(/^"|"$/g, '').replaceAll('""', '"');
+        row.append(element);
+      }
+      table.append(row);
+    }
+    target.replaceChildren(table);
+  };
+
+  const downloadAttachment = async (record: AttachmentRecord) => {
+    try {
+      const response = await attachmentRead(record, 'download');
+      if (!response.ok) throw new Error('Attachment download is unavailable.');
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = record.display_filename;
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (cause) {
+      attachmentStatus.textContent = cause instanceof Error ? cause.message : 'Download failed.';
+    }
+  };
+
+  const renameRecord = async (record: AttachmentRecord) => {
+    const displayFilename = window.prompt('Display filename', record.display_filename);
+    if (displayFilename === null || displayFilename.trim() === record.display_filename) return;
+    try {
+      const response = await adminFetch(apiOrigin, `/api/admin/attachments/${encodeURIComponent(record.id)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': session.csrfToken },
+        body: JSON.stringify({ displayFilename })
+      }, fetcher, session);
+      if (!response.ok) throw new Error('Attachment could not be renamed.');
+      attachmentStatus.textContent = 'Attachment display name updated.';
+      await refreshLibrary();
+    } catch (cause) {
+      attachmentStatus.textContent = cause instanceof Error ? cause.message : 'Rename failed.';
+    }
+  };
+
+  const removeRecord = async (record: AttachmentRecord) => {
+    if (!window.confirm(`Permanently delete ${record.display_filename}? This cannot be undone.`)) return;
+    try {
+      const response = await adminFetch(apiOrigin, `/api/admin/attachments/${encodeURIComponent(record.id)}`, {
+        method: 'DELETE',
+        headers: { 'X-CSRF-Token': session.csrfToken }
+      }, fetcher, session);
+      if (response.status === 409) throw new Error('Remove this attachment from every saved or published article before deleting it.');
+      if (!response.ok) throw new Error('Attachment could not be deleted.');
+      attachmentStatus.textContent = 'Attachment deleted.';
+      await refreshLibrary();
+    } catch (cause) {
+      attachmentStatus.textContent = cause instanceof Error ? cause.message : 'Delete failed.';
+    }
+  };
+
+  const copyAttachmentLink = async (record: AttachmentRecord) => {
+    try {
+      const articleId = await currentArticleId();
+      const link = new URL(`/api/attachments/${record.id}/download`, apiOrigin);
+      link.searchParams.set('articleId', articleId);
+      await navigator.clipboard.writeText(link.href);
+      attachmentStatus.textContent = 'Attachment link copied. It becomes publicly readable only after its article is published.';
+    } catch {
+      attachmentStatus.textContent = 'Could not copy the attachment link.';
+    }
+  };
+
   const updatePreview = () => {
     const current = currentContent();
     const safeCover = current.coverUrl && !isSafeCoverUrl(current.coverUrl) ? null : current.coverUrl;
@@ -232,7 +722,7 @@ export async function mountArticleEditorUi(
       ...current.tags.map((tag) => `#${tag}`)
     ].filter(Boolean).join(' · ');
     previewMeta.replaceChildren(heading, description, details);
-    renderSafeMarkdown(current.body, previewBody, safeCover, current.title);
+    renderSafeMarkdown(current.body, previewBody, safeCover, current.title, apiOrigin);
   };
 
   const refreshActions = () => {
@@ -425,6 +915,103 @@ export async function mountArticleEditorUi(
     } else {
       previewPane.querySelector<HTMLElement>('h2')?.focus();
     }
+  });
+  root.querySelector<HTMLButtonElement>('[data-insert-image]')!.addEventListener('click', () => {
+    filePicker.accept = 'image/*';
+    filePicker.value = '';
+    filePicker.click();
+  });
+  root.querySelector<HTMLButtonElement>('[data-insert-file]')!.addEventListener('click', () => {
+    filePicker.accept = '';
+    filePicker.value = '';
+    filePicker.click();
+  });
+  filePicker.addEventListener('change', () => {
+    if (filePicker.files?.length) void uploadFiles(Array.from(filePicker.files));
+    filePicker.value = '';
+  });
+  replacePicker.addEventListener('change', () => {
+    const file = replacePicker.files?.[0];
+    const attachmentId = replacePicker.dataset.attachmentId;
+    delete replacePicker.dataset.attachmentId;
+    if (file && attachmentId) void uploadFiles([file], attachmentId);
+  });
+  cancelUploadButton.addEventListener('click', () => uploadController?.abort());
+  retryUploadButton.addEventListener('click', () => {
+    const retry = [...failedUploads];
+    failedUploads = [];
+    void uploadFiles(retry);
+  });
+  libraryToggle.addEventListener('click', () => {
+    const opening = attachmentLibrary.hidden;
+    attachmentLibrary.hidden = !opening;
+    libraryToggle.setAttribute('aria-expanded', String(opening));
+    if (opening) void refreshLibrary();
+  });
+  let searchTimer: number | undefined;
+  librarySearch.addEventListener('input', () => {
+    window.clearTimeout(searchTimer);
+    searchTimer = window.setTimeout(() => void refreshLibrary(), 250);
+  });
+  libraryType.addEventListener('change', () => void refreshLibrary());
+  libraryFrom.addEventListener('change', () => void refreshLibrary());
+  libraryTo.addEventListener('change', () => void refreshLibrary());
+  librarySort.addEventListener('change', () => void refreshLibrary());
+  root.querySelector<HTMLButtonElement>('[data-viewer-close]')!.addEventListener('click', () => viewer.close());
+  viewerPrevious.addEventListener('click', () => moveViewer(-1));
+  viewerNext.addEventListener('click', () => moveViewer(1));
+  viewerZoomOut.addEventListener('click', () => setViewerZoom(viewerZoom / 1.25));
+  viewerZoomReset.addEventListener('click', () => setViewerZoom(1));
+  viewerZoomIn.addEventListener('click', () => setViewerZoom(viewerZoom * 1.25));
+  viewerFullscreen.disabled = typeof viewer.requestFullscreen !== 'function';
+  viewerFullscreen.addEventListener('click', () => {
+    const change = document.fullscreenElement === viewer
+      ? document.exitFullscreen()
+      : viewer.requestFullscreen();
+    void change.catch(() => {
+      attachmentStatus.textContent = 'Fullscreen mode could not be opened.';
+    });
+  });
+  document.addEventListener('fullscreenchange', () => {
+    viewerFullscreen.textContent = document.fullscreenElement === viewer ? 'Exit fullscreen' : 'Fullscreen';
+  });
+  viewer.addEventListener('keydown', (event) => {
+    if (event.key === 'ArrowLeft') moveViewer(-1);
+    if (event.key === 'ArrowRight') moveViewer(1);
+  });
+  viewer.addEventListener('close', () => {
+    viewerLoadId += 1;
+    viewerContent.replaceChildren();
+    if (viewerObjectUrl) URL.revokeObjectURL(viewerObjectUrl);
+    viewerObjectUrl = null;
+    viewerImage = null;
+    activeViewerRecord = null;
+    updateViewerControls();
+  });
+  viewerDownload.addEventListener('click', () => {
+    if (activeViewerRecord) void downloadAttachment(activeViewerRecord);
+  });
+  root.addEventListener('drop', (event) => {
+    if (!(event.target instanceof Node) ||
+        !sourceHost.contains(event.target) && !fallback.contains(event.target)) return;
+    const files = Array.from(event.dataTransfer?.files ?? []);
+    if (!files.length) return;
+    event.preventDefault();
+    void uploadFiles(files);
+  });
+  root.addEventListener('dragover', (event) => {
+    if (!(event.target instanceof Node) ||
+        !sourceHost.contains(event.target) && !fallback.contains(event.target)) return;
+    if (Array.from(event.dataTransfer?.types ?? []).includes('Files')) event.preventDefault();
+  });
+  root.addEventListener('paste', (event) => {
+    const imageFiles = Array.from(event.clipboardData?.items ?? [])
+      .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => file !== null);
+    if (!imageFiles.length) return;
+    event.preventDefault();
+    void uploadFiles(imageFiles);
   });
 
   saveButton.addEventListener('click', async () => {

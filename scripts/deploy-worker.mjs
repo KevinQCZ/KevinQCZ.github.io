@@ -10,10 +10,11 @@ const root = fileURLToPath(new URL('../', import.meta.url));
 const workerName = 'kevinqcz-github-io';
 const variableNames = [
   'ADMIN_GITHUB_IDS', 'API_ORIGIN', 'GITHUB_APP_ID',
-  'GITHUB_APP_INSTALLATION_ID', 'GITHUB_CLIENT_ID', 'SITE_ORIGIN'
+  'GITHUB_APP_INSTALLATION_ID', 'GITHUB_CLIENT_ID', 'MAX_ATTACHMENT_BYTES',
+  'MAX_ATTACHMENT_STORAGE_BYTES', 'SITE_ORIGIN'
 ];
 const secretNames = ['CSRF_SECRET', 'GITHUB_APP_PRIVATE_KEY', 'GITHUB_CLIENT_SECRET'];
-const bindingNames = [...variableNames, ...secretNames, 'DB', 'AUTH_RATE_LIMITER', 'WRITE_RATE_LIMITER'];
+const bindingNames = [...variableNames, ...secretNames, 'ATTACHMENTS', 'DB', 'AUTH_RATE_LIMITER', 'WRITE_RATE_LIMITER'];
 const emptyList = z.array(z.never());
 const sampleRate = z.number().min(0).max(1);
 const telemetry = z.strictObject({
@@ -30,6 +31,10 @@ const bindingSchema = z.discriminatedUnion('type', [
     type: z.literal('d1'), name: z.literal('DB'),
     database_id: z.uuid(), id: z.uuid()
   }).refine((binding) => binding.id === binding.database_id),
+  z.strictObject({
+    type: z.literal('r2_bucket'), name: z.literal('ATTACHMENTS'),
+    bucket_name: z.string().min(3)
+  }),
   z.strictObject({
     type: z.literal('ratelimit'), name: z.enum(['AUTH_RATE_LIMITER', 'WRITE_RATE_LIMITER']),
     namespace_id: z.string().regex(/^\d+$/),
@@ -93,6 +98,9 @@ export function createDeploymentConfig(input, accountId) {
     observability: settings.observability,
     d1_databases: settings.bindings.filter((binding) => binding.type === 'd1').map((binding) => ({
       binding: binding.name, database_id: binding.database_id
+    })),
+    r2_buckets: settings.bindings.filter((binding) => binding.type === 'r2_bucket').map((binding) => ({
+      binding: binding.name, bucket_name: binding.bucket_name
     })),
     ratelimits: settings.bindings.filter((binding) => binding.type === 'ratelimit').map((binding) => ({
       name: binding.name, namespace_id: binding.namespace_id, simple: binding.simple

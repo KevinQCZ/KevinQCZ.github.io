@@ -5,15 +5,28 @@ import {
   GitHubSourceError,
   listPublishedArticles,
   publishArticleDraft,
+  publishedArticleId,
   publishedArticleConflicts,
   type ArticlePublicationInput,
   validArticlePath,
   type GitHubAppConfig,
   type PublishedArticle
 } from './github';
+import {
+  deleteAttachment,
+  getAttachment,
+  listAttachments,
+  readAttachment,
+  renameAttachment,
+  replaceAttachment,
+  syncArticleAttachments,
+  uploadAttachment,
+  validateAttachmentReferences
+} from './attachments';
 
 interface Env {
   DB: D1Database;
+  ATTACHMENTS: R2Bucket;
   AUTH_RATE_LIMITER: RateLimit;
   WRITE_RATE_LIMITER: RateLimit;
   SITE_ORIGIN: string;
@@ -255,6 +268,14 @@ function headers(request: Request, cfg: Config): Headers {
   return result;
 }
 
+function addStandardHeaders(response: Response, request: Request, cfg: Config): Response {
+  const standard = headers(request, cfg);
+  standard.forEach((value, key) => {
+    if (!response.headers.has(key)) response.headers.set(key, value);
+  });
+  return response;
+}
+
 function json(request: Request, cfg: Config, status: number, body: object): Response {
   const h = headers(request, cfg);
   h.set('Content-Type', 'application/json; charset=utf-8');
@@ -310,7 +331,8 @@ export function requireAdmin(
 export async function requireCsrfProtection(
   request: Request,
   auth: AuthContext,
-  cfg: Config
+  cfg: Config,
+  allowBinaryUpload = false
 ): Promise<Response | null> {
   const supplied = request.headers.get('X-CSRF-Token') || '';
   const expected = await csrf(auth.token, cfg.csrfSecret);
@@ -320,7 +342,7 @@ export async function requireCsrfProtection(
   for (let i = 0; i < Math.max(suppliedBytes.length, expectedBytes.length); i += 1) {
     difference |= (suppliedBytes[i] || 0) ^ (expectedBytes[i] || 0);
   }
-  return validUnsafeRequest(request, cfg) && difference === 0
+  return validUnsafeRequest(request, cfg, allowBinaryUpload) && difference === 0
     ? null
     : error(request, cfg, 403, 'forbidden');
 }
@@ -366,16 +388,23 @@ async function adminArticleList(request: Request, env: Env, cfg: Config): Promis
   }
   if (cfg.githubApp && publishedSourceError === null) {
     const pending = await env.DB.prepare(
-      `SELECT id, article_path, revision, submitted_revision, pull_request_number
+      `SELECT id, article_path, revision, submitted_revision, pull_request_number, updated_by
        FROM article_drafts WHERE status = 'PENDING_PUBLICATION'
        AND pull_request_number IS NOT NULL ORDER BY updated_at DESC LIMIT 20`
-    ).all<Pick<DraftRow, 'id' | 'article_path' | 'revision' | 'submitted_revision' | 'pull_request_number'>>();
+    ).all<Pick<DraftRow, 'id' | 'article_path' | 'revision' | 'submitted_revision' | 'pull_request_number' | 'updated_by'>>();
     for (const draft of pending.results) {
       try {
         const pullRequest = await getPullRequest(cfg.githubApp, draft.pull_request_number!);
         if (pullRequest.state === 'MERGED') {
           const currentFile = articles.find((article) => article.articlePath === draft.article_path);
           if (!currentFile) continue;
+          const mergedArticle = await getPublishedArticle(cfg.githubApp, currentFile.id);
+          if (!mergedArticle || !await syncArticleAttachments(
+            env, currentFile.id, mergedArticle.body, draft.updated_by, cfg.api, 'published'
+          )) {
+            publishedSourceError = 'unavailable';
+            continue;
+          }
           const isLatestRevision = draft.revision === draft.submitted_revision;
           await env.DB.prepare(
             `UPDATE article_drafts SET status = ?, publication_state = 'MERGED',
@@ -488,6 +517,10 @@ async function createManagedDraft(
     }
   }
 
+  const articleKey = await publishedArticleId(articlePath);
+  if (!await validateAttachmentReferences(env, input.body, cfg.api, articleKey)) {
+    return error(request, cfg, 400, 'invalid_attachment_reference');
+  }
   const existing = await env.DB.prepare(
     `SELECT ${DRAFT_COLUMNS} FROM article_drafts
      WHERE permalink = ? OR article_path = ? LIMIT 1`
@@ -517,6 +550,9 @@ async function createManagedDraft(
       `SELECT ${DRAFT_COLUMNS} FROM article_drafts WHERE id = ?`
     ).bind(existing.id).first<DraftRow>();
     if (!row) return error(request, cfg, 503, 'draft_save_failed');
+    if (!await syncArticleAttachments(env, articleKey, row.body, userId, cfg.api, 'private', true)) {
+      return error(request, cfg, 400, 'invalid_attachment_reference');
+    }
     return json(request, cfg, 201, { draft: storedDraft(row) });
   }
 
@@ -546,6 +582,9 @@ async function createManagedDraft(
     `SELECT ${DRAFT_COLUMNS} FROM article_drafts WHERE id = ?`
   ).bind(id).first<DraftRow>();
   if (!row) return error(request, cfg, 503, 'draft_save_failed');
+  if (!await syncArticleAttachments(env, articleKey, row.body, userId, cfg.api, 'private', true)) {
+    return error(request, cfg, 400, 'invalid_attachment_reference');
+  }
   return json(request, cfg, 201, { draft: storedDraft(row) });
 }
 
@@ -568,6 +607,13 @@ async function updateManagedDraft(
   if (!existing) return error(request, cfg, 404, 'not_found');
   if (input.permalink !== existing.permalink || input.sourceFormat !== existing.source_format) {
     return error(request, cfg, 400, 'invalid_draft');
+  }
+  if (!existing.article_path) {
+    return error(request, cfg, 400, 'invalid_attachment_reference');
+  }
+  const articleKey = await publishedArticleId(existing.article_path);
+  if (!await validateAttachmentReferences(env, input.body, cfg.api, articleKey)) {
+    return error(request, cfg, 400, 'invalid_attachment_reference');
   }
   const now = Date.now();
   const [updated] = await env.DB.batch([
@@ -598,6 +644,9 @@ async function updateManagedDraft(
     `SELECT ${DRAFT_COLUMNS} FROM article_drafts WHERE id = ?`
   ).bind(id).first<DraftRow>();
   if (!row) return error(request, cfg, 503, 'draft_save_failed');
+  if (!await syncArticleAttachments(env, articleKey, row.body, userId, cfg.api, 'private', true)) {
+    return error(request, cfg, 400, 'invalid_attachment_reference');
+  }
   return json(request, cfg, 200, { draft: storedDraft(row) });
 }
 
@@ -627,6 +676,10 @@ async function publishManagedDraft(
   if (!row.article_path || !validArticlePath(row.article_path) ||
       !row.article_path.endsWith(`.${row.source_format}`)) {
     return error(request, cfg, 400, 'invalid_article_path');
+  }
+  const articleKey = await publishedArticleId(row.article_path);
+  if (!await validateAttachmentReferences(env, row.body, cfg.api, articleKey)) {
+    return error(request, cfg, 400, 'invalid_attachment_reference');
   }
 
   const trackedBranch = row.publication_state === 'MERGED' ? null : row.publication_branch;
@@ -716,6 +769,9 @@ async function deleteManagedDraft(
   userId: string,
   id: string
 ): Promise<Response> {
+  const draft = await env.DB.prepare(
+    `SELECT article_path, base_sha FROM article_drafts WHERE id = ? AND status = 'DRAFT'`
+  ).bind(id).first<{ article_path: string | null; base_sha: string | null }>();
   const now = Date.now();
   const [deleted] = await env.DB.batch([
     env.DB.prepare(
@@ -728,9 +784,25 @@ async function deleteManagedDraft(
        SELECT ?, ?, 'draft.delete', ?, 'success', 'draft', ? WHERE changes() = 1`
     ).bind(crypto.randomUUID(), userId, now, id)
   ]);
-  return deleted.meta.changes === 1
-    ? json(request, cfg, 200, { ok: true })
-    : error(request, cfg, 404, 'not_found');
+  if (deleted.meta.changes !== 1) return error(request, cfg, 404, 'not_found');
+  if (draft?.article_path) {
+    const articleKey = await publishedArticleId(draft.article_path);
+    if (draft.base_sha && cfg.githubApp) {
+      try {
+        const published = await getPublishedArticle(cfg.githubApp, articleKey);
+        if (published) {
+          await syncArticleAttachments(env, articleKey, published.body, userId, cfg.api, 'published');
+        } else {
+          await syncArticleAttachments(env, articleKey, '', userId, cfg.api);
+        }
+      } catch {
+        return error(request, cfg, 503, 'published_source_unavailable');
+      }
+    } else {
+      await syncArticleAttachments(env, articleKey, '', userId, cfg.api);
+    }
+  }
+  return json(request, cfg, 200, { ok: true });
 }
 
 async function providerJson(response: Response): Promise<unknown> {
@@ -1072,11 +1144,13 @@ async function exchangeHandoff(request: Request, env: Env, cfg: Config): Promise
   });
 }
 
-function validUnsafeRequest(request: Request, cfg: Config): boolean {
+function validUnsafeRequest(request: Request, cfg: Config, allowBinaryUpload = false): boolean {
   const fetchSite = request.headers.get('Sec-Fetch-Site');
+  const contentType = request.headers.get('Content-Type') || '';
   return request.headers.get('Origin') === cfg.site &&
     (!fetchSite || ['cross-site', 'same-site', 'same-origin'].includes(fetchSite)) &&
-    /^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(request.headers.get('Content-Type') || '');
+    (/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(contentType) ||
+      allowBinaryUpload && contentType === 'application/octet-stream');
 }
 
 function safeReturnPath(value: string | null, cfg: Config): string | null {
@@ -1103,13 +1177,18 @@ async function handle(request: Request, env: Env, cfg: Config, diagnostics: Requ
     const method = request.headers.get('Access-Control-Request-Method');
     const requestedHeaders = (request.headers.get('Access-Control-Request-Headers') || '')
       .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
-    if (request.headers.get('Origin') !== cfg.site || !['GET', 'POST', 'PUT', 'DELETE'].includes(method || '') ||
-        requestedHeaders.some((h) => !['authorization', 'content-type', 'x-csrf-token'].includes(h))) {
+    if (request.headers.get('Origin') !== cfg.site || !['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(method || '') ||
+        requestedHeaders.some((h) => ![
+          'authorization', 'content-type', 'x-attachment-name', 'x-attachment-type', 'x-csrf-token'
+        ].includes(h))) {
       return error(request, cfg, 403, 'forbidden');
     }
     const h = headers(request, cfg);
-    h.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    h.set('Access-Control-Allow-Headers', 'Authorization, Content-Type, X-CSRF-Token');
+    h.set('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+    h.set(
+      'Access-Control-Allow-Headers',
+      'Authorization, Content-Type, X-Attachment-Name, X-Attachment-Type, X-CSRF-Token'
+    );
     h.set('Vary', 'Origin, Access-Control-Request-Method, Access-Control-Request-Headers');
     return new Response(null, { status: 204, headers: h });
   }
@@ -1117,6 +1196,32 @@ async function handle(request: Request, env: Env, cfg: Config, diagnostics: Requ
   if (path === '/auth/github/callback' && request.method === 'GET') return callback(request, env, cfg, diagnostics);
   if (path === '/api/auth/exchange' && request.method === 'POST') {
     return exchangeHandoff(request, env, cfg);
+  }
+  const publicAttachment = /^\/api\/attachments\/([^/]+)\/(preview|download)$/.exec(routePath);
+  if (publicAttachment && request.method === 'GET') {
+    let id: string;
+    try {
+      id = decodeURIComponent(publicAttachment[1]);
+    } catch {
+      return error(request, cfg, 404, 'not_found');
+    }
+    let admin: { githubUserId: string } | null = null;
+    if (request.headers.has('Authorization')) {
+      const auth = await requireAuthentication(request, env, cfg);
+      if (auth instanceof Response) return auth;
+      const adminError = requireAdmin(request, auth, cfg);
+      if (adminError) return adminError;
+      admin = { githubUserId: auth.session.github_user_id };
+    }
+    return addStandardHeaders(await readAttachment(
+      request,
+      env,
+      { githubApp: cfg.githubApp, apiOrigin: cfg.api },
+      id,
+      publicAttachment[2] as 'preview' | 'download',
+      url.searchParams.get('articleId'),
+      admin
+    ), request, cfg);
   }
   if (
     path === '/api/me' || path === '/api/logout' ||
@@ -1136,6 +1241,72 @@ async function handle(request: Request, env: Env, cfg: Config, diagnostics: Requ
         },
         csrfToken: await csrf(auth.token, cfg.csrfSecret)
       });
+    }
+    if (routePath === '/api/admin/attachments' && request.method === 'GET') {
+      return addStandardHeaders(await listAttachments(request, env), request, cfg);
+    }
+    if (routePath === '/api/admin/attachments/upload' && request.method === 'POST') {
+      const csrfError = await requireCsrfProtection(request, auth, cfg, true);
+      if (csrfError) return csrfError;
+      if (!await limit(request, env.WRITE_RATE_LIMITER, 'attachment-upload')) {
+        return error(request, cfg, 429, 'rate_limited');
+      }
+      return addStandardHeaders(
+        await uploadAttachment(request, env, auth.session.github_user_id), request, cfg
+      );
+    }
+    const attachmentMatch = /^\/api\/admin\/attachments\/([^/]+)(\/replace)?$/.exec(routePath);
+    if (attachmentMatch) {
+      let id: string;
+      try {
+        id = decodeURIComponent(attachmentMatch[1]);
+      } catch {
+        return error(request, cfg, 400, 'invalid_attachment_id');
+      }
+      if (attachmentMatch[2] && request.method === 'POST') {
+        const csrfError = await requireCsrfProtection(request, auth, cfg, true);
+        if (csrfError) return csrfError;
+        if (!await limit(request, env.WRITE_RATE_LIMITER, 'attachment-replace')) {
+          return error(request, cfg, 429, 'rate_limited');
+        }
+        return addStandardHeaders(
+          await replaceAttachment(request, env, auth.session.github_user_id, id), request, cfg
+        );
+      }
+      if (!attachmentMatch[2] && request.method === 'GET') {
+        return addStandardHeaders(await getAttachment(request, env, id), request, cfg);
+      }
+      if (!attachmentMatch[2] && request.method === 'PATCH') {
+        const csrfError = await requireCsrfProtection(request, auth, cfg);
+        if (csrfError) return csrfError;
+        if (!await limit(request, env.WRITE_RATE_LIMITER, 'attachment-rename')) {
+          return error(request, cfg, 429, 'rate_limited');
+        }
+        let payload: unknown;
+        try {
+          payload = await requestJson(request);
+        } catch (cause) {
+          return cause instanceof PayloadTooLargeError
+            ? error(request, cfg, 413, 'payload_too_large')
+            : error(request, cfg, 400, 'invalid_json');
+        }
+        return addStandardHeaders(
+          await renameAttachment(request, env, auth.session.github_user_id, id, payload), request, cfg
+        );
+      }
+      if (!attachmentMatch[2] && request.method === 'DELETE') {
+        const csrfError = await requireCsrfProtection(request, auth, cfg);
+        if (csrfError) return csrfError;
+        if (!await limit(request, env.WRITE_RATE_LIMITER, 'attachment-delete')) {
+          return error(request, cfg, 429, 'rate_limited');
+        }
+        return addStandardHeaders(
+          await deleteAttachment(request, env, auth.session.github_user_id, id, {
+            githubApp: cfg.githubApp,
+            apiOrigin: cfg.api
+          }), request, cfg
+        );
+      }
     }
     if (routePath === '/api/admin/articles' && request.method === 'GET') {
       return adminArticleList(request, env, cfg);

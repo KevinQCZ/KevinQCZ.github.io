@@ -85,18 +85,47 @@ generated keys and mocked GitHub responses, not a real App. Worker tests cover
 OAuth, handoff replay/expiry, draft authorization, CSRF, validation, persistence,
 stale-source conflicts, PR create/update/reopen, and merge synchronization.
 
+### Article attachments
+
+The admin editor uploads attachments to the Worker, which validates filenames,
+file extensions, declared MIME types, and file signatures before storing bytes
+in the private `ATTACHMENTS` R2 bucket. Supported extensions are JPG/JPEG, PNG,
+WebP, GIF, SVG, PDF, TXT, MD, CSV, DOCX, XLSX, PPTX, ZIP, MP3, WAV, MP4, and
+WebM. SVG is not served inline. The defaults are 20 MiB per file and 1 GiB total
+storage; `MAX_ATTACHMENT_BYTES` and `MAX_ATTACHMENT_STORAGE_BYTES` override
+those limits, up to 100 MiB per file and 1 TiB total.
+
+Markdown image and file links use the Worker API. An attachment remains private
+until a saved article references it and that exact reference is present in the
+published article source; public reads are checked against both D1 relationships
+and the current GitHub source. Deletion is blocked while a saved or published
+article references the attachment. D1 migration `0006_attachments.sql` adds the
+attachment catalog, article relationships, replacement history, and audit
+context.
+
+For a new deployment, create an R2 bucket and bind it as `ATTACHMENTS` in the
+production config. Set the bucket name and attachment limits alongside the
+existing placeholders, then apply the D1 migrations (including `0006`) and
+deploy using the reviewed production procedure below. The repository does not
+provision Cloudflare resources automatically; verify the deployed Worker,
+database, and bucket bindings before applying migrations or deploying. Do not
+run remote setup commands against an existing service without explicit approval.
+
 ### Cloudflare and GitHub setup
 
-The production Worker, D1 database, OAuth app, and GitHub App are not provisioned
-by this repository. `worker/wrangler.jsonc` and `.dev.vars.example` are local
-development templates; do not deploy the local config. Start with
+The repository does not provision production Cloudflare or GitHub resources.
+`worker/wrangler.jsonc` and `.dev.vars.example` are local development templates;
+do not deploy the local config. A production Worker may already be configured,
+so inspect its actual resources before making infrastructure changes. Start with
 `worker/wrangler.production.example.jsonc`, copy it to the ignored
 `worker/wrangler.production.jsonc`, and replace every `REPLACE_WITH_*` value.
 Do not commit credentials or private keys.
 
-1. Create a Cloudflare D1 database and set its returned ID in the production
-   config. The sample rate-limit namespace IDs are placeholders; configure
-   unique IDs for AUTH_RATE_LIMITER and WRITE_RATE_LIMITER in your account.
+1. Create a Cloudflare D1 database and private R2 bucket, and set their returned
+   identifiers/names in the production config. Create the R2 bucket with
+   `npx wrangler r2 bucket create BUCKET_NAME`. The sample rate-limit namespace
+   IDs are placeholders; configure unique IDs for AUTH_RATE_LIMITER and
+   WRITE_RATE_LIMITER in your account.
    Keep `SITE_ORIGIN` as `https://kevinqcz.github.io`; set `API_ORIGIN` to the
    exact HTTPS Worker URL, for example the assigned `workers.dev` hostname.
 2. Register a GitHub OAuth App with callback URL

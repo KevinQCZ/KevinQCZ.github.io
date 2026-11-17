@@ -221,7 +221,7 @@ function validArticlePath(path: unknown): path is string {
     !path.split('/').some((part) => part === '.' || part === '..');
 }
 
-async function articleId(path: string): Promise<string> {
+export async function publishedArticleId(path: string): Promise<string> {
   const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(path)));
   return `a_${base64Url(digest).slice(0, 22)}`;
 }
@@ -251,7 +251,7 @@ async function treeFiles(
     }
     const path = entry.path as string;
     files.push({
-      id: await articleId(path),
+      id: await publishedArticleId(path),
       articlePath: path,
       sha: entry.sha,
       fileName: path.slice(path.lastIndexOf('/') + 1)
@@ -328,6 +328,22 @@ export async function getPublishedArticle(
   const file = (await treeFiles(token, fetcher)).find((candidate) => candidate.id === id);
   if (!file) return null;
   return parsePublishedArticle(file, await getBlob(token, file.sha, fetcher));
+}
+
+export async function publishedArticlesReferencingAttachment(
+  config: GitHubAppConfig,
+  attachmentId: string,
+  fetcher: typeof fetch = fetch
+): Promise<string[]> {
+  const token = await installationToken(config, fetcher);
+  const files = await treeFiles(token, fetcher);
+  const marker = `/api/attachments/${attachmentId.toLowerCase()}/`;
+  const references: string[] = [];
+  for (const file of files) {
+    const article = parsePublishedArticle(file, await getBlob(token, file.sha, fetcher));
+    if (article.body.toLowerCase().includes(marker)) references.push(article.id);
+  }
+  return references;
 }
 
 export async function publishedArticleConflicts(
